@@ -7,6 +7,7 @@ from src.dataset import ReviewDataset
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 # Config
 MAX_LEN = 256
@@ -17,8 +18,8 @@ LR = 2e-5
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Datasets
-train_dataset = ReviewDataset("../datasets/processed/train.csv", max_len=MAX_LEN)
-val_dataset = ReviewDataset("../datasets/processed/val.csv", max_len=MAX_LEN)
+train_dataset = ReviewDataset("../datasets/preprocessed/train.csv", max_len=MAX_LEN)
+val_dataset = ReviewDataset("../datasets/preprocessed/val.csv", max_len=MAX_LEN)
 
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
@@ -37,7 +38,8 @@ criterion = nn.MSELoss()
 def train_epoch(model, loader, optimizer, scheduler, criterion):
     model.train()
     losses = []
-    for batch in loader:
+    pbar = tqdm(loader, desc="Training", leave=False)
+    for batch in pbar:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         targets = batch["target"].to(device)
@@ -51,6 +53,7 @@ def train_epoch(model, loader, optimizer, scheduler, criterion):
         scheduler.step()
 
         losses.append(loss.item())
+        pbar.set_postfix(loss=loss.item())
     return np.mean(losses)
 
 def eval_epoch(model, loader, criterion):
@@ -58,8 +61,9 @@ def eval_epoch(model, loader, criterion):
     losses = []
     preds = []
     true = []
+    pbar = tqdm(loader, desc="Validation", leave=False)
     with torch.no_grad():
-        for batch in loader:
+        for batch in pbar:
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             targets = batch["target"].to(device)
@@ -71,19 +75,21 @@ def eval_epoch(model, loader, criterion):
             preds.extend(outputs.cpu().numpy())
             true.extend(targets.cpu().numpy())
 
+            pbar.set_postfix(loss=loss.item())
     return np.mean(losses), np.array(preds), np.array(true)
 
 train_losses = []
 val_losses = []
 
 for epoch in range(EPOCHS):
+    print(f"Epoch {epoch+1}/{EPOCHS}")
     train_loss = train_epoch(model, train_loader, optimizer, scheduler, criterion)
     val_loss, val_preds, val_true = eval_epoch(model, val_loader, criterion)
 
     train_losses.append(train_loss)
     val_losses.append(val_loss)
 
-    print(f"Epoch {epoch+1}/{EPOCHS}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+    print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
 
 # Save model
 torch.save(model.state_dict(), "../outputs/checkpoints/bert_model.pth")
