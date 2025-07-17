@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import get_cosine_schedule_with_warmup
+from torch.optim import AdamW
 from models.bert_model import BERTRegressor
 from src.dataset import ReviewDataset
 import numpy as np
@@ -12,48 +13,61 @@ from tqdm import tqdm
 # Config
 MAX_LEN = 256
 BATCH_SIZE = 8
-EPOCHS = 3
+EPOCHS = 10
 LR = 2e-5
+GRAD_ACCUM_STEPS = 2
+PATIENCE = 2
+WEIGHT_DECAY = 0.01
+DROPOUT_RATE = 0.2
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 # Datasets
 train_dataset = ReviewDataset("../datasets/preprocessed/train.csv", max_len=MAX_LEN)
 val_dataset = ReviewDataset("../datasets/preprocessed/val.csv", max_len=MAX_LEN)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, pin_memory=True)
 
 # Model
-model = BERTRegressor()
+model = BERTRegressor(dropout_rate=DROPOUT_RATE)
 model = model.to(device)
 
 # Optimizer & Scheduler
-optimizer = AdamW(model.parameters(), lr=LR)
-total_steps = len(train_loader) * EPOCHS
-scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
+optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+total_steps = len(train_loader) // GRAD_ACCUM_STEPS * EPOCHS
+scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
 
 criterion = nn.MSELoss()
+scaler = torch.amp.GradScaler()
 
 def train_epoch(model, loader, optimizer, scheduler, criterion):
     model.train()
     losses = []
+    optimizer.zero_grad()
     pbar = tqdm(loader, desc="Training", leave=False)
-    for batch in pbar:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        targets = batch["target"].to(device)
 
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        loss = criterion(outputs, targets)
+    for step, batch in enumerate(pbar):
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        targets = batch["target"].to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
+        with torch.amp.autocast(device_type='cuda'):
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            loss = criterion(outputs, targets) / GRAD_ACCUM_STEPS
 
-        losses.append(loss.item())
-        pbar.set_postfix(loss=loss.item())
+        scaler.scale(loss).backward()
+
+        if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(loader):
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        losses.append(loss.item() * GRAD_ACCUM_STEPS)
+        pbar.set_postfix(loss=(loss.item() * GRAD_ACCUM_STEPS))
+
     return np.mean(losses)
 
 def eval_epoch(model, loader, criterion):
@@ -64,12 +78,13 @@ def eval_epoch(model, loader, criterion):
     pbar = tqdm(loader, desc="Validation", leave=False)
     with torch.no_grad():
         for batch in pbar:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            targets = batch["target"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            targets = batch["target"].to(device, non_blocking=True)
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss = criterion(outputs, targets)
+            with torch.cuda.amp.autocast():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs, targets)
             losses.append(loss.item())
 
             preds.extend(outputs.cpu().numpy())
@@ -81,6 +96,9 @@ def eval_epoch(model, loader, criterion):
 train_losses = []
 val_losses = []
 
+best_val_loss = float("inf")
+patience_counter = 0
+
 for epoch in range(EPOCHS):
     print(f"Epoch {epoch+1}/{EPOCHS}")
     train_loss = train_epoch(model, train_loader, optimizer, scheduler, criterion)
@@ -91,8 +109,16 @@ for epoch in range(EPOCHS):
 
     print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
 
-# Save model
-torch.save(model.state_dict(), "../outputs/checkpoints/bert_model.pth")
+    # Early stopping
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), "../outputs/checkpoints/bert_model_best.pth")
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        if patience_counter >= PATIENCE:
+            print("Early stopping triggered.")
+            break
 
 # Plot loss curves
 plt.figure(figsize=(8, 5))
@@ -104,10 +130,3 @@ plt.legend()
 plt.grid(True)
 plt.savefig("../outputs/plots/bert_loss_curve.png")
 plt.close()
-
-# Optional: Save validation predictions
-val_df = pd.read_csv("../datasets/processed/val.csv")
-val_df["pred_log"] = val_preds
-val_df["pred_original"] = np.expm1(val_preds)
-val_df["true_original"] = np.expm1(val_true)
-val_df.to_csv("../outputs/predictions/bert_val_predictions.csv", index=False)

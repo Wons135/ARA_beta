@@ -7,7 +7,7 @@ class ReviewDataset(Dataset):
     def __init__(self, csv_file, tokenizer_name="bert-base-uncased", max_len=256):
         self.data = pd.read_csv(csv_file)
         self.texts = self.data["full_text"].tolist()
-        self.targets = self.data["helpfulness_ratio_log"].values
+        self.targets = self.data["helpfulness_score"].values
         self.tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
         self.max_len = max_len
 

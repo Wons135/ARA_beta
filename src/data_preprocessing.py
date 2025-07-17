@@ -42,18 +42,14 @@ reviews_df["full_text"] = reviews_df["clean_title"].fillna('') + ". " + reviews_
 reviews_df['helpful_vote'] = reviews_df['helpful_vote'].astype(int)
 reviews_df['rating'] = reviews_df['rating'].astype(int)
 
-# Compute helpfulness ratio
-reviews_df["helpfulness_ratio"] = reviews_df.apply(
-    lambda row: row["helpful_vote"] / row["rating"] if row["rating"] > 0 else np.nan,
-    axis=1
-)
-
 # Filter reviews
 reviews_df = reviews_df[reviews_df["helpful_vote"] >= 5].copy()
-reviews_df = reviews_df.dropna(subset=["helpfulness_ratio"])
+# reviews_df = reviews_df.dropna(subset=["helpfulness_ratio"])
 
 # Log-transform helpfulness ratio
-reviews_df["helpfulness_ratio_log"] = np.log1p(reviews_df["helpfulness_ratio"])
+cap_value = reviews_df["helpful_vote"].quantile(0.99)
+reviews_df["helpful_vote_capped"] = np.minimum(reviews_df["helpful_vote"], cap_value)
+reviews_df["helpfulness_score"] = np.log1p(reviews_df["helpful_vote_capped"])
 
 # Additional features
 reviews_df["review_length"] = reviews_df["clean_text"].apply(lambda x: len(x.split()))
@@ -89,7 +85,7 @@ feature_columns = [
 ]
 
 X = reviews_df[feature_columns]
-y = reviews_df["helpfulness_ratio_log"]
+y = reviews_df["helpfulness_score"]
 
 # Drop rows with missing values
 mask = X.notnull().all(axis=1) & y.notnull()
