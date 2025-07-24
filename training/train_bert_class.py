@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import get_cosine_schedule_with_warmup
 from torch.optim import AdamW
-from models.bert_model import BERTRegressor
+from models.bert_model import BERTClassifier
 from src.dataset import ReviewDataset
 import numpy as np
 import pandas as pd
@@ -19,6 +19,7 @@ GRAD_ACCUM_STEPS = 2
 PATIENCE = 2
 WEIGHT_DECAY = 0.01
 DROPOUT_RATE = 0.2
+NUM_CLASSES = 5
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -31,7 +32,7 @@ train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, pi
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, pin_memory=True)
 
 # Model
-model = BERTRegressor(dropout_rate=DROPOUT_RATE)
+model = BERTClassifier(dropout_rate=DROPOUT_RATE, num_classes=NUM_CLASSES)
 model = model.to(device)
 
 # Optimizer & Scheduler
@@ -39,7 +40,8 @@ optimizer = AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 total_steps = len(train_loader) // GRAD_ACCUM_STEPS * EPOCHS
 scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=total_steps)
 
-criterion = nn.MSELoss()
+criterion = nn.CrossEntropyLoss()
+
 scaler = torch.amp.GradScaler()
 
 def train_epoch(model, loader, optimizer, scheduler, criterion):
@@ -51,11 +53,12 @@ def train_epoch(model, loader, optimizer, scheduler, criterion):
     for step, batch in enumerate(pbar):
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        targets = batch["target"].to(device, non_blocking=True)
+        targets = batch["target"].long().to(device, non_blocking=True)
 
         with torch.amp.autocast(device_type='cuda'):
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             loss = criterion(outputs, targets) / GRAD_ACCUM_STEPS
+
 
         scaler.scale(loss).backward()
 
@@ -80,14 +83,14 @@ def eval_epoch(model, loader, criterion):
         for batch in pbar:
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            targets = batch["target"].to(device, non_blocking=True)
+            targets = batch["target"].long().to(device, non_blocking=True)
 
             with torch.cuda.amp.autocast():
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 loss = criterion(outputs, targets)
-            losses.append(loss.item())
 
-            preds.extend(outputs.cpu().numpy())
+            losses.append(loss.item())
+            preds.extend(torch.argmax(outputs, dim=1).cpu().numpy())
             true.extend(targets.cpu().numpy())
 
             pbar.set_postfix(loss=loss.item())
@@ -112,7 +115,7 @@ for epoch in range(EPOCHS):
     # Early stopping
     if val_loss < best_val_loss:
         best_val_loss = val_loss
-        torch.save(model.state_dict(), "../outputs/checkpoints/bert_model_reg.pth")
+        torch.save(model.state_dict(), "../outputs/checkpoints/bert_model_class.pth")
         patience_counter = 0
     else:
         patience_counter += 1
@@ -125,7 +128,7 @@ plt.figure(figsize=(8, 5))
 plt.plot(train_losses, label="Train Loss")
 plt.plot(val_losses, label="Validation Loss")
 plt.xlabel("Epoch")
-plt.ylabel("Loss (MSE on log scale)")
+plt.ylabel("Loss (CrossEntropy)")
 plt.legend()
 plt.grid(True)
 plt.savefig("../outputs/plots/bert_loss_curve.png")

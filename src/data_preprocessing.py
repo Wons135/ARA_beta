@@ -46,10 +46,15 @@ reviews_df['rating'] = reviews_df['rating'].astype(int)
 reviews_df = reviews_df[reviews_df["helpful_vote"] >= 5].copy()
 # reviews_df = reviews_df.dropna(subset=["helpfulness_ratio"])
 
-# Log-transform helpfulness ratio
+# Remove outliers beyond 99th percentile
 cap_value = reviews_df["helpful_vote"].quantile(0.99)
 reviews_df["helpful_vote_capped"] = np.minimum(reviews_df["helpful_vote"], cap_value)
 reviews_df["helpfulness_score"] = np.log1p(reviews_df["helpful_vote_capped"])
+
+# Create quantile-based classes (0–4)
+reviews_df["helpfulness_class"] = pd.qcut(
+    reviews_df["helpfulness_score"], q=5, labels=False, duplicates="drop"
+)
 
 # Additional features
 reviews_df["review_length"] = reviews_df["clean_text"].apply(lambda x: len(x.split()))
@@ -77,6 +82,10 @@ reviews_df["timestamp"] = reviews_df["timestamp"]
 
 # ---------- Select Features ----------
 
+score = reviews_df["helpfulness_score"]
+cls = reviews_df["helpfulness_class"]
+
+
 feature_columns = [
     "review_length",
     "sentiment_score",
@@ -85,7 +94,7 @@ feature_columns = [
 ]
 
 X = reviews_df[feature_columns]
-y = reviews_df["helpfulness_score"]
+y = score
 
 # Drop rows with missing values
 mask = X.notnull().all(axis=1) & y.notnull()
@@ -95,25 +104,31 @@ reviews_df = reviews_df.loc[mask]
 
 # ---------- Split ----------
 
-X_train, X_temp, y_train, y_temp, text_train, text_temp, rating_train, rating_temp, hv_train, hv_temp = train_test_split(
-    X, y, reviews_df["full_text"], reviews_df["rating"], reviews_df["helpful_vote"],
+X_train, X_temp, y_train, y_temp, score_train, score_temp, text_train, text_temp, rating_train, rating_temp, hv_train, hv_temp = train_test_split(
+    X, y, score, reviews_df["full_text"], reviews_df["rating"], reviews_df["helpful_vote"],
     test_size=0.3,
     random_state=42,
     stratify=pd.qcut(y, q=10, duplicates="drop")
 )
 
-X_val, X_test, y_val, y_test, text_val, text_test, rating_val, rating_test, hv_val, hv_test = train_test_split(
-    X_temp, y_temp, text_temp, rating_temp, hv_temp,
+X_val, X_test, y_val, y_test, score_val, score_test, text_val, text_test, rating_val, rating_test, hv_val, hv_test = train_test_split(
+    X_temp, y_temp, score_temp, text_temp, rating_temp, hv_temp,
     test_size=0.5,
     random_state=42,
     stratify=pd.qcut(y_temp, q=5, duplicates="drop")
 )
 
+
 # ---------- Save ----------
 
-train_df = pd.concat([X_train, y_train, text_train, rating_train, hv_train], axis=1)
-val_df = pd.concat([X_val, y_val, text_val, rating_val, hv_val], axis=1)
-test_df = pd.concat([X_test, y_test, text_test, rating_test, hv_test], axis=1)
+train_df = pd.concat([X_train, y_train, score_train, text_train, rating_train, hv_train], axis=1)
+val_df = pd.concat([X_val, y_val, score_val, text_val, rating_val, hv_val], axis=1)
+test_df = pd.concat([X_test, y_test, score_test, text_test, rating_test, hv_test], axis=1)
+
+train_df.columns = list(X_train.columns) + ["helpfulness_class", "helpfulness_score", "full_text", "rating", "helpful_vote"]
+val_df.columns = list(X_val.columns) + ["helpfulness_class", "helpfulness_score", "full_text", "rating", "helpful_vote"]
+test_df.columns = list(X_test.columns) + ["helpfulness_class", "helpfulness_score", "full_text", "rating", "helpful_vote"]
+
 
 train_df.to_csv("../datasets/preprocessed/train.csv", index=False)
 val_df.to_csv("../datasets/preprocessed/val.csv", index=False)
