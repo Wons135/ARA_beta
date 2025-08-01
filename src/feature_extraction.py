@@ -6,9 +6,9 @@ from sklearn.preprocessing import StandardScaler
 from textblob import TextBlob
 
 # Load pre-split datasets
-train_df = pd.read_csv("../datasets/preprocessed/train.csv")
-test_df = pd.read_csv("../datasets/preprocessed/test.csv")
-val_df = pd.read_csv("../datasets/preprocessed/val.csv")
+train_df = pd.read_csv("../datasets/preprocessed/class_train.csv")
+test_df = pd.read_csv("../datasets/preprocessed/class_test.csv")
+val_df = pd.read_csv("../datasets/preprocessed/class_val.csv")
 
 # ---------- Add smoothed helpfulness score ----------
 

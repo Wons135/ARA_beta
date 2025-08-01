@@ -5,6 +5,7 @@ from models.xgboost_model import XGBoostModel
 import time
 from tqdm import tqdm
 from xgboost.callback import TrainingCallback
+import torch
 
 
 class TQDMCallback(TrainingCallback):
@@ -20,15 +21,18 @@ class TQDMCallback(TrainingCallback):
         return model
 
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 # ---------- CONFIG ----------
-TASK = "regression"  # "regression" or "classification"
+TASK = "classification"  # "regression" or "classification"
 
 CONFIG = {
     "n_estimators": 100,
     "max_depth": 6,
     "learning_rate": 0.1,
-    "tree_method": "gpu_hist",         # Enable GPU training
-    "predictor": "gpu_predictor",      # Optional but improves inference
+    "tree_method": "hist",
+    "device": "cuda",
+    "predictor": "gpu_predictor",
     "verbosity": 1
 }
 
@@ -36,7 +40,7 @@ X_train_path = "../datasets/preprocessed/X_train_features.csv"
 y_train_path = "../datasets/preprocessed/y_train.csv"
 X_val_path = "../datasets/preprocessed/X_val_features.csv"
 y_val_path = "../datasets/preprocessed/y_val.csv"
-MODEL_OUTPUT = "../outputs/checkpoints/xgboost_model.json"
+MODEL_OUTPUT = "../outputs/checkpoints/class_xgboost_model.json"
 IMPORTANCE_PLOT = "../outputs/plots/feature_importance.png"
 
 # ---------- Load Data ----------
@@ -70,7 +74,7 @@ model.model.save_model(MODEL_OUTPUT)
 print(f"Model saved to {MODEL_OUTPUT}")
 
 # ---------- Plot Feature Importance ----------
-xgb.plot_importance(model.model)
+xgb.plot_importance(model.model, max_num_features=20, importance_type='weight', height=0.5)
 plt.tight_layout()
 plt.savefig(IMPORTANCE_PLOT)
 print(f"Feature importance plot saved to {IMPORTANCE_PLOT}")

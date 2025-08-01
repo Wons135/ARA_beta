@@ -94,7 +94,7 @@ feature_columns = [
 ]
 
 X = reviews_df[feature_columns]
-y = score
+y = cls
 
 # Drop rows with missing values
 mask = X.notnull().all(axis=1) & y.notnull()
@@ -130,6 +130,6 @@ val_df.columns = list(X_val.columns) + ["helpfulness_class", "helpfulness_score"
 test_df.columns = list(X_test.columns) + ["helpfulness_class", "helpfulness_score", "full_text", "rating", "helpful_vote"]
 
 
-train_df.to_csv("../datasets/preprocessed/train.csv", index=False)
-val_df.to_csv("../datasets/preprocessed/val.csv", index=False)
-test_df.to_csv("../datasets/preprocessed/test.csv", index=False)
+train_df.to_csv("../datasets/preprocessed/class_train.csv", index=False)
+val_df.to_csv("../datasets/preprocessed/class_val.csv", index=False)
+test_df.to_csv("../datasets/preprocessed/class_test.csv", index=False)

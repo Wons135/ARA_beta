@@ -12,7 +12,7 @@ from sklearn.metrics import (
 TASK = "classification"  # "regression" or "classification"
 X_val_path = "../datasets/preprocessed/X_val_features.csv"
 y_val_path = "../datasets/preprocessed/y_val.csv"
-MODEL_INPUT = "../outputs/models/xgboost_model.json"
+MODEL_INPUT = "../outputs/checkpoints/class_xgboost_model.json" # input the model you want
 
 # ---------- Load Data ----------
 X_val = pd.read_csv(X_val_path)
