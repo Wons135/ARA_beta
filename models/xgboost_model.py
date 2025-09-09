@@ -1,24 +1,23 @@
 import xgboost as xgb
 
 class XGBoostModel:
-    def __init__(self, task="classification", **kwargs):
+    def __init__(self, task="binary", **kwargs):
         """
-        task: "classification" or "regression"
-        kwargs: pass XGBoost-specific config like tree_method, device, etc.
+        task: "binary" or "regression"
+        kwargs: XGBoost params (tree_method, device, etc.)
         """
         self.task = task
         base_params = {
-            "tree_method": "hist",      # Needed for GPU
-            "device": "cuda",           # Target device
-            "predictor": "gpu_predictor"  # Optional but faster on GPU
+            "tree_method": "hist",
+            "device": "cuda",
+            "predictor": "gpu_predictor",
         }
         base_params.update(kwargs)
 
-        if task == "classification":
+        if task == "binary":
             self.model = xgb.XGBClassifier(
-                objective="multi:softprob",
-                num_class=5,
-                eval_metric="mlogloss",
+                objective="binary:logistic",
+                eval_metric="logloss",  # or "aucpr"
                 use_label_encoder=False,
                 **base_params
             )
@@ -29,14 +28,14 @@ class XGBoostModel:
                 **base_params
             )
         else:
-            raise ValueError("Unsupported task type. Choose 'classification' or 'regression'.")
+            raise ValueError("Unsupported task. Use 'binary' or 'regression'.")
 
-    def fit(self, X_train, y_train, X_val=None, y_val=None):
+    def fit(self, X_train, y_train, X_val=None, y_val=None, early_stopping_rounds=50):
         if X_val is not None and y_val is not None:
             self.model.fit(
                 X_train, y_train,
                 eval_set=[(X_val, y_val)],
-                early_stopping_rounds=10,
+                early_stopping_rounds=early_stopping_rounds,
                 verbose=True
             )
         else:
@@ -46,10 +45,9 @@ class XGBoostModel:
         return self.model.predict(X)
 
     def predict_proba(self, X):
-        if self.task == "classification":
+        if self.task == "binary":
             return self.model.predict_proba(X)
-        else:
-            raise RuntimeError("predict_proba is only available for classification.")
+        raise RuntimeError("predict_proba is only available for binary classification.")
 
     def save(self, path):
         self.model.save_model(path)

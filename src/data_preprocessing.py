@@ -1,135 +1,209 @@
-import pandas as pd
-import numpy as np
-import json
+import os
 import re
-from sklearn.model_selection import train_test_split
-from nltk.sentiment import SentimentIntensityAnalyzer
-from nltk import download
-from datetime import datetime
+import json
+import numpy as np
+import pandas as pd
 from tqdm import tqdm
 
-# Download VADER lexicon for sentiment analysis
+from sklearn.model_selection import train_test_split
+
+# Sentiment
+from nltk import download
+from nltk.sentiment import SentimentIntensityAnalyzer
 download("vader_lexicon")
 sia = SentimentIntensityAnalyzer()
 
-# ---------- Load Reviews ----------
+# ------------------- CONFIG -------------------
+RAW_JSONL = "../datasets/Movies_and_TV.jsonl"
 
-reviews_path = '../datasets/Movies_and_TV.jsonl'
+# Tokenization/cleaning
+MIN_TOKENS = 10
 
-reviews_list = []
-with open(reviews_path, 'r') as fp:
-    for line in tqdm(fp, desc="Loading reviews"):
-        data = json.loads(line.strip())
-        reviews_list.append(data)
+# Capping + target transforms
+CAP_Q = 0.99  # cap helpful votes at 99th percentile
+BIN_POS_Q = 0.95  # positive threshold quantile computed on TRAIN ONLY
+BIN_NEG_Q = 0.70  # negative threshold quantile computed on TRAIN ONLY
+APPLY_GRAY_BAND = True
+GRAY_BAND = 0.00  # set >0 (e.g., 0.02) to widen the drop zone around thresholds
 
-reviews_df = pd.DataFrame(reviews_list)
+# Optional age filter for binary only (to remove "not yet labeled" near-zero reviews)
+APPLY_AGE_FILTER = True
+DAYS_OLD_MIN = 14  # require at least 14 days old when helpful_vote <= 1
 
-# ---------- Preprocess Reviews ----------
+# Splits
+RANDOM_STATE = 42
+TRAIN_PCT = 0.7
+VAL_PCT_OF_TEMP = 0.5  # of the remaining 30%
+
+# ------------------------------------------------
 
 def clean_text(text):
     if not isinstance(text, str):
         return ""
     text = re.sub(r"<.*?>", "", text)
     text = re.sub(r"[^\x00-\x7F]+", " ", text)
-    text = text.lower()
-    return text.strip()
+    return text.lower().strip()
 
+def parse_timestamp(ts):
+    """
+    Tries to parse timestamp to pandas datetime.
+    - If numeric-looking: first try seconds since epoch; if too small/large, try ms.
+    - Else, let pandas infer.
+    Returns pandas.Timestamp or NaT.
+    """
+    try:
+        if pd.isna(ts):
+            return pd.NaT
+        # numeric?
+        if isinstance(ts, (int, float, np.integer, np.floating)) or (isinstance(ts, str) and ts.isdigit()):
+            ts = float(ts)
+            # if looks like ms epoch
+            if ts > 1e12:
+                return pd.to_datetime(ts, unit="ms", utc=True)
+            # if looks like s epoch
+            if ts > 1e9:
+                return pd.to_datetime(ts, unit="s", utc=True)
+            # fallback: let pandas guess
+            return pd.to_datetime(ts, utc=True, errors="coerce")
+        # string datetime
+        return pd.to_datetime(ts, utc=True, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+def load_reviews(path):
+    rows = []
+    with open(path, "r", encoding="utf-8") as fp:
+        for line in tqdm(fp, desc="Loading reviews"):
+            rows.append(json.loads(line.strip()))
+    df = pd.DataFrame(rows)
+    return df
+
+print("➡️  Loading raw reviews...")
+reviews_df = load_reviews(RAW_JSONL)
+
+# ------------ Clean & basic features ------------
+print("➡️  Cleaning text and building features...")
 reviews_df["clean_text"] = reviews_df["text"].apply(clean_text)
 reviews_df["clean_title"] = reviews_df["title"].apply(clean_text)
 reviews_df["full_text"] = reviews_df["clean_title"].fillna('') + ". " + reviews_df["clean_text"].fillna('')
 
-# Type conversion for consistency
-reviews_df['helpful_vote'] = reviews_df['helpful_vote'].astype(int)
-reviews_df['rating'] = reviews_df['rating'].astype(int)
+# types
+reviews_df["helpful_vote"] = pd.to_numeric(reviews_df["helpful_vote"], errors="coerce").fillna(0).astype(int)
+reviews_df["rating"] = pd.to_numeric(reviews_df.get("rating", np.nan), errors="coerce").fillna(0).astype(int)
+reviews_df["is_verified"] = reviews_df.get("verified_purchase", False).astype(bool).astype(int)
 
-# Filter reviews
-reviews_df = reviews_df[reviews_df["helpful_vote"] >= 5].copy()
-# reviews_df = reviews_df.dropna(subset=["helpfulness_ratio"])
-
-# Remove outliers beyond 99th percentile
-cap_value = reviews_df["helpful_vote"].quantile(0.99)
-reviews_df["helpful_vote_capped"] = np.minimum(reviews_df["helpful_vote"], cap_value)
-reviews_df["helpfulness_score"] = np.log1p(reviews_df["helpful_vote_capped"])
-
-# Create quantile-based classes (0–4)
-reviews_df["helpfulness_class"] = pd.qcut(
-    reviews_df["helpfulness_score"], q=5, labels=False, duplicates="drop"
-)
-
-# Additional features
+# lengths & sentiment
 reviews_df["review_length"] = reviews_df["clean_text"].apply(lambda x: len(x.split()))
 reviews_df["sentiment_score"] = reviews_df["clean_text"].apply(lambda x: sia.polarity_scores(x)["compound"])
-reviews_df["is_verified"] = reviews_df["verified_purchase"].astype(int)
-reviews_df["timestamp"] = reviews_df["timestamp"]
 
-# ---------- Filter Metadata ---------- # commented out as not explicitly needed in research
+# timestamp -> age
+print("➡️  Parsing timestamps...")
+reviews_df["timestamp_parsed"] = reviews_df.get("timestamp", pd.NaT).apply(parse_timestamp)
+now = pd.Timestamp.utcnow()
+reviews_df["review_age_days"] = (now - reviews_df["timestamp_parsed"]).dt.days
 
-# meta_df = meta_df[meta_df["main_category"].isin(["Movies & TV", "Prime Video"])].copy()
+# basic content filter (keep super-short out)
+base = reviews_df[reviews_df["review_length"] >= MIN_TOKENS].copy()
 
-# ---------- Preprocess Metadata ----------
+# ---------------- Targets (shared transforms) ----------------
+print("➡️  Building targets (cap + log)...")
+cap_value = base["helpful_vote"].quantile(CAP_Q)
+base["helpful_vote_capped"] = np.minimum(base["helpful_vote"], cap_value)
+base["log_helpfulness_score"] = np.log1p(base["helpful_vote_capped"])
+max_log = base["log_helpfulness_score"].max() if base["log_helpfulness_score"].max() > 0 else 1.0
+base["normalized_helpfulness_score"] = (base["log_helpfulness_score"] / max_log) * 10.0
 
-# meta_df["price"] = pd.to_numeric(meta_df["price"], errors='coerce')
-# meta_df["has_description"] = meta_df["description"].notnull().astype(int)
-# meta_df["store_known"] = meta_df["store"].notnull().astype(int)
-# meta_df["main_category"] = meta_df["main_category"].fillna("Unknown")
+# ============================================================
+#                 REGRESSION DATASET
+#   (keep full distribution; no age/gray filtering)
+# ============================================================
+print("➡️  Preparing REGRESSION splits...")
+reg_df = base.copy()
+reg_df["regression_score"] = reg_df["log_helpfulness_score"]
 
-# ---------- Merge ----------
+# Required columns
+reg_required = ["full_text", "regression_score", "review_length", "sentiment_score",
+                "is_verified", "rating", "helpful_vote", "timestamp_parsed", "review_age_days"]
+reg_df = reg_df.dropna(subset=["full_text", "regression_score"]).copy()
 
-# merged_df = reviews_df.merge(meta_df[["parent_asin", "price", "has_description", "store_known", "main_category"]],
-#                              left_on="parent_asin", right_on="parent_asin", how="left")
-#
-# merged_df = pd.get_dummies(merged_df, columns=["main_category"], drop_first=False)
+# Stratify on deciles of regression target for stable splits
+reg_strat = pd.qcut(reg_df["regression_score"], q=10, labels=False, duplicates="drop")
 
-# ---------- Select Features ----------
-
-score = reviews_df["helpfulness_score"]
-cls = reviews_df["helpfulness_class"]
-
-
-feature_columns = [
-    "review_length",
-    "sentiment_score",
-    "is_verified",
-    "timestamp",
-]
-
-X = reviews_df[feature_columns]
-y = cls
-
-# Drop rows with missing values
-mask = X.notnull().all(axis=1) & y.notnull()
-X = X[mask]
-y = y[mask]
-reviews_df = reviews_df.loc[mask]
-
-# ---------- Split ----------
-
-X_train, X_temp, y_train, y_temp, score_train, score_temp, text_train, text_temp, rating_train, rating_temp, hv_train, hv_temp = train_test_split(
-    X, y, score, reviews_df["full_text"], reviews_df["rating"], reviews_df["helpful_vote"],
-    test_size=0.3,
-    random_state=42,
-    stratify=pd.qcut(y, q=10, duplicates="drop")
+reg_train, reg_temp = train_test_split(
+    reg_df, test_size=1.0 - TRAIN_PCT, stratify=reg_strat, random_state=RANDOM_STATE
+)
+reg_temp_strat = pd.qcut(reg_temp["regression_score"], q=5, labels=False, duplicates="drop")
+reg_val, reg_test = train_test_split(
+    reg_temp, test_size=VAL_PCT_OF_TEMP, stratify=reg_temp_strat, random_state=RANDOM_STATE
 )
 
-X_val, X_test, y_val, y_test, score_val, score_test, text_val, text_test, rating_val, rating_test, hv_val, hv_test = train_test_split(
-    X_temp, y_temp, score_temp, text_temp, rating_temp, hv_temp,
-    test_size=0.5,
-    random_state=42,
-    stratify=pd.qcut(y_temp, q=5, duplicates="drop")
+os.makedirs("../datasets/preprocessed", exist_ok=True)
+reg_train.to_csv("../datasets/preprocessed/regression_score_train.csv", index=False)
+reg_val.to_csv("../datasets/preprocessed/regression_score_val.csv", index=False)
+reg_test.to_csv("../datasets/preprocessed/regression_score_test.csv", index=False)
+print("✅ Saved regression splits to ../datasets/preprocessed/")
+
+# ============================================================
+#                   BINARY DATASET (precision-oriented)
+#   - compute thresholds from TRAIN ONLY
+#   - drop gray zone
+#   - optional age filter for (<=1 vote & too new)
+# ============================================================
+print("➡️  Preparing BINARY splits (precision‑oriented)...")
+bin_df = base.copy()
+
+# Optional age filter: drop likely-not-yet-labeled near-zero reviews
+if APPLY_AGE_FILTER:
+    before = len(bin_df)
+    mask_drop = (bin_df["helpful_vote"] <= 1) & (bin_df["review_age_days"].notna()) & (bin_df["review_age_days"] < DAYS_OLD_MIN)
+    bin_df = bin_df[~mask_drop].copy()
+    print(f"   • Age filter removed {before - len(bin_df)} rows (<=1 vote & <{DAYS_OLD_MIN} days old).")
+
+# Split first (using regression-like spectrum strat to keep distribution stable)
+bin_strat = pd.qcut(bin_df["log_helpfulness_score"], q=10, labels=False, duplicates="drop")
+bin_train, bin_temp = train_test_split(
+    bin_df, test_size=1.0 - TRAIN_PCT, stratify=bin_strat, random_state=RANDOM_STATE
+)
+bin_temp_strat = pd.qcut(bin_temp["log_helpfulness_score"], q=5, labels=False, duplicates="drop")
+bin_val, bin_test = train_test_split(
+    bin_temp, test_size=VAL_PCT_OF_TEMP, stratify=bin_temp_strat, random_state=RANDOM_STATE
 )
 
+# Compute pos/neg thresholds from TRAIN ONLY (normalized space)
+pos_thr = bin_train["normalized_helpfulness_score"].quantile(BIN_POS_Q)
+neg_thr = bin_train["normalized_helpfulness_score"].quantile(BIN_NEG_Q)
 
-# ---------- Save ----------
+# Optional gray band widening around thresholds
+if APPLY_GRAY_BAND and GRAY_BAND > 0:
+    pos_thr_eff = pos_thr + GRAY_BAND * (10.0)  # scale by range (0..10)
+    neg_thr_eff = neg_thr - GRAY_BAND * (10.0)
+else:
+    pos_thr_eff = pos_thr
+    neg_thr_eff = neg_thr
 
-train_df = pd.concat([X_train, y_train, score_train, text_train, rating_train, hv_train], axis=1)
-val_df = pd.concat([X_val, y_val, score_val, text_val, rating_val, hv_val], axis=1)
-test_df = pd.concat([X_test, y_test, score_test, text_test, rating_test, hv_test], axis=1)
+def label_and_filter(df, neg_thr, pos_thr):
+    s = df["normalized_helpfulness_score"]
+    labels = np.full(len(df), fill_value=-1, dtype=np.int64)
+    labels[s >= pos_thr] = 1
+    labels[s <= neg_thr] = 0
+    keep = labels >= 0
+    out = df.loc[keep].copy()
+    out["binary_label"] = labels[keep]
+    return out
 
-train_df.columns = list(X_train.columns) + ["helpfulness_class", "helpfulness_score", "full_text", "rating", "helpful_vote"]
-val_df.columns = list(X_val.columns) + ["helpfulness_class", "helpfulness_score", "full_text", "rating", "helpful_vote"]
-test_df.columns = list(X_test.columns) + ["helpfulness_class", "helpfulness_score", "full_text", "rating", "helpful_vote"]
+bin_train_l = label_and_filter(bin_train, neg_thr_eff, pos_thr_eff)
+bin_val_l   = label_and_filter(bin_val,   neg_thr_eff, pos_thr_eff)
+bin_test_l  = label_and_filter(bin_test,  neg_thr_eff, pos_thr_eff)
 
+print(f"   • Train sizes: before={len(bin_train)} after={len(bin_train_l)} | pos%={bin_train_l['binary_label'].mean():.3f}")
+print(f"   •   Val sizes: before={len(bin_val)}   after={len(bin_val_l)}   | pos%={bin_val_l['binary_label'].mean():.3f}")
+print(f"   •  Test sizes: before={len(bin_test)}  after={len(bin_test_l)}  | pos%={bin_test_l['binary_label'].mean():.3f}")
+print(f"   • Thresholds (TRAIN): neg≤{neg_thr:.3f}  pos≥{pos_thr:.3f}  (effective: neg≤{neg_thr_eff:.3f} pos≥{pos_thr_eff:.3f})")
 
-train_df.to_csv("../datasets/preprocessed/class_train.csv", index=False)
-val_df.to_csv("../datasets/preprocessed/class_val.csv", index=False)
-test_df.to_csv("../datasets/preprocessed/class_test.csv", index=False)
+# Save
+bin_train_l.to_csv("../datasets/preprocessed/binary_label_train.csv", index=False)
+bin_val_l.to_csv("../datasets/preprocessed/binary_label_val.csv", index=False)
+bin_test_l.to_csv("../datasets/preprocessed/binary_label_test.csv", index=False)
+print("✅ Saved binary splits to ../datasets/preprocessed/")
+
+print("Done.")
