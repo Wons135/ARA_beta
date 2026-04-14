@@ -1,213 +1,292 @@
-# training/train_xgboost.py
-import os, json, time, logging
+from __future__ import annotations
+
+import argparse
+import logging
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
 import numpy as np
-import pandas as pd
-from scipy import sparse as sp
-import matplotlib.pyplot as plt
-from tqdm import tqdm
+import torch
 import xgboost as xgb
+from tqdm import tqdm
 from xgboost.callback import TrainingCallback
-from sklearn.metrics import (
-    roc_auc_score, average_precision_score, accuracy_score,
-    precision_score, recall_score, f1_score,
-    mean_squared_error, r2_score, precision_recall_curve
+
+from xgboost_common import (
+    ModeT,
+    checkpoint_path,
+    compute_binary_metrics,
+    compute_count_metrics,
+    default_model_metadata,
+    get_mode_spec,
+    load_split_bundle,
+    prediction_csv_path,
+    safe_path,
+    save_checkpoint_metadata,
+    save_feature_importance_plot,
+    save_json,
+    setup_logger,
+    sha256_file,
+    threshold_path,
+    to_raw_count_predictions,
 )
 
-# ------------ CONFIG ------------
-TASK = "regression"   # "binary" | "regression"
-task_suffix = "binary" if TASK == "binary" else "regression"
 
-X_DIR = "../datasets/preprocessed"
-OUT_DIR = "../outputs"
-os.makedirs(os.path.join(OUT_DIR, "logs"), exist_ok=True)
-os.makedirs(os.path.join(OUT_DIR, "checkpoints"), exist_ok=True)
-os.makedirs(os.path.join(OUT_DIR, "plots"), exist_ok=True)
+ROOT = Path(__file__).resolve().parents[1]
 
-LOG_PATH = os.path.join(OUT_DIR, "logs", f"train_xgb_precomputed_{task_suffix}.log")
-MODEL_PATH = os.path.join(OUT_DIR, "checkpoints", f"xgb_precomputed_{task_suffix}.json")
-THRESHOLD_PATH = os.path.join(OUT_DIR, "checkpoints", f"xgb_precomputed_{task_suffix}_decision_threshold.json")
-IMPLOT_PATH = os.path.join(OUT_DIR, "plots", f"xgb_precomputed_{task_suffix}_fi.png")
-CURVE_PATH = os.path.join(OUT_DIR, "plots", f"xgb_precomputed_{task_suffix}_curves.png")
-HIST_PATH  = os.path.join(OUT_DIR, "logs",  f"xgb_precomputed_{task_suffix}_eval_history.csv")
-
-X_train_npz = os.path.join(X_DIR, f"X_train_features_{task_suffix}.npz")
-X_val_npz   = os.path.join(X_DIR, f"X_val_features_{task_suffix}.npz")
-y_train_csv = os.path.join(X_DIR, f"y_train_{task_suffix}.csv")
-y_val_csv   = os.path.join(X_DIR, f"y_val_{task_suffix}.csv")
-
-# ---- tuned defaults for text ----
-XGB_PARAMS = dict(
-    n_estimators=2000,            # fewer trees, higher lr
-    max_depth=6,
-    learning_rate=0.05,
-    min_child_weight=5,
-    subsample=0.8,
-    colsample_bytree=0.7,
-    tree_method="hist",
-    device="cuda",
-    predictor="gpu_predictor",
-    reg_lambda=2.0,
-    reg_alpha=0.1,
-    random_state=42,
-)
-EARLY_STOP = 200
-VERBOSE_EVAL = 50
-
-TARGET_PRECISION = 0.30
-MIN_RECALL = 0.15
-SAVE_PRECISION_OPT_THR = True
-
-# ------------ Logging ------------
-logger = logging.getLogger(f"train_xgb_precomputed_{task_suffix}")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-ch = logging.StreamHandler(); ch.setLevel(logging.INFO)
-fh = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8"); fh.setLevel(logging.INFO)
-fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-ch.setFormatter(fmt); fh.setFormatter(fmt)
-logger.addHandler(ch); logger.addHandler(fh)
 
 class TQDMCallback(TrainingCallback):
-    def __init__(self, total):
+    def __init__(self, total: int) -> None:
         self.pbar = tqdm(total=total, desc="Boosting")
-    def after_iteration(self, model, epoch, evals_log):
-        self.pbar.update(1); return False
+
+    def after_iteration(self, model, epoch: int, evals_log) -> bool:
+        self.pbar.update(1)
+        return False
+
     def after_training(self, model):
-        self.pbar.close(); return model
+        self.pbar.close()
+        return model
 
-def pick_precision_threshold(probs, labels, target_prec=0.3, min_recall=0.15):
-    precs, recs, thrs = precision_recall_curve(labels, probs)
-    best = dict(thr=0.5, p=0.0, r=0.0, f1=0.0)
-    for p, r, t in zip(precs[:-1], recs[:-1], thrs):
-        if np.isfinite(p) and p >= target_prec and r >= min_recall:
-            f1 = 2*p*r/(p+r+1e-12)
-            if f1 > best["f1"]:
-                best = dict(thr=float(t), p=float(p), r=float(r), f1=float(f1))
-    if best["f1"] == 0.0 and len(thrs):
-        f1s = []
-        for t in thrs:
-            pr = (probs >= t).astype(int)
-            P = precision_score(labels, pr, zero_division=0)
-            R = recall_score(labels, pr, zero_division=0)
-            f1s.append(2*P*R/(P+R+1e-12))
-        i = int(np.argmax(f1s))
-        best["thr"] = float(thrs[i])
-        pr = (probs >= best["thr"]).astype(int)
-        best["p"] = float(precision_score(labels, pr, zero_division=0))
-        best["r"] = float(recall_score(labels, pr, zero_division=0))
-        best["f1"] = float(f1s[i])
-    return best
 
-# ------------ Load ------------
-def load_sparse(path):
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing features file: {path}\n"
-                                "Re-run feature_extraction.py for the same TASK to generate task-suffixed features.")
-    return sp.load_npz(path)
+@dataclass
+class XGBConfig:
+    mode: ModeT = "binary"
+    base_dir: str = str(ROOT / "datasets" / "preprocessed")
+    out_dir: str = str(ROOT / "outputs")
+    early_stop: int = 300
+    verbose_eval: int = 50
+    target_precision: float = 0.30
+    min_recall: float = 0.15
+    save_precision_thr: bool = True
+    random_seed: int = 42
+    xgb_params: dict | None = None
 
-logger.info("Loading precomputed features...")
-X_train = load_sparse(X_train_npz)
-X_val   = load_sparse(X_val_npz)
-y_train = pd.read_csv(y_train_csv).squeeze().values
-y_val   = pd.read_csv(y_val_csv).squeeze().values
+    def __post_init__(self) -> None:
+        spec = get_mode_spec(self.mode)
+        if self.xgb_params is None:
+            use_cuda = torch.cuda.is_available()
+            params = dict(
+                n_estimators=5000,
+                max_depth=7,
+                learning_rate=0.04,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                tree_method="hist",
+                device="cuda" if use_cuda else "cpu",
+                predictor="gpu_predictor" if use_cuda else "cpu_predictor",
+                reg_lambda=1.5,
+                reg_alpha=0.0,
+                random_state=self.random_seed,
+            )
+            if spec.role == "classifier":
+                params["objective"] = spec.default_objective
+                params["eval_metric"] = spec.default_eval_metric
+            else:
+                params["objective"] = spec.default_objective
+                params["eval_metric"] = spec.default_eval_metric
+            self.xgb_params = params
 
-if X_train.shape[0] != len(y_train):
-    raise RuntimeError(f"Row mismatch: X_train rows={X_train.shape[0]} vs y_train rows={len(y_train)}.")
-if X_val.shape[0] != len(y_val):
-    raise RuntimeError(f"Row mismatch: X_val rows={X_val.shape[0]} vs y_val rows={len(y_val)}.")
 
-if TASK == "binary":
-    y_train = y_train.astype(int)
-    y_val   = y_val.astype(int)
-else:
-    y_train = y_train.astype(np.float32)
-    y_val   = y_val.astype(np.float32)
+class XGBTrainer:
+    def __init__(self, cfg: XGBConfig):
+        self.cfg = cfg
+        self.spec = get_mode_spec(cfg.mode)
+        self.logger = setup_logger(f"xgb_train_{cfg.mode}")
+        np.random.seed(cfg.random_seed)
+        xgb.set_config(verbosity=0)
 
-logger.info(f"X_train: {X_train.shape}, X_val: {X_val.shape}")
+        log_path = safe_path(cfg.out_dir, "logs", f"{self.spec.checkpoint_stem}.log")
+        if not any(
+            isinstance(handler, logging.FileHandler) and Path(handler.baseFilename).resolve() == Path(log_path).resolve()
+            for handler in self.logger.handlers
+        ):
+            file_handler = xgb_train_file_handler(log_path)
+            self.logger.addHandler(file_handler)
 
-# ------------ Params / imbalance ------------
-params = dict(XGB_PARAMS)
-if TASK == "binary":
-    params.update(objective="binary:logistic", eval_metric=["logloss", "aucpr"])
-    pos = int((y_train == 1).sum()); neg = int((y_train == 0).sum())
-    if pos > 0:
-        params["scale_pos_weight"] = neg / max(1, pos)
-        logger.info(f"scale_pos_weight={params['scale_pos_weight']:.3f} (neg/pos)")
-elif TASK == "regression":
-    params.update(objective="reg:squarederror", eval_metric=["rmse"])
+    def load_data(self):
+        self.logger.info("Loading %s training/validation data", self.cfg.mode)
+        train_bundle = load_split_bundle(self.cfg.base_dir, "train", self.cfg.mode, self.logger)
+        val_bundle = load_split_bundle(self.cfg.base_dir, "val", self.cfg.mode, self.logger)
 
-model = xgb.XGBClassifier(**params) if TASK=="binary" else xgb.XGBRegressor(**params)
+        if train_bundle.X.shape[0] != train_bundle.y.shape[0]:
+            raise RuntimeError("Train feature/label row mismatch.")
+        if val_bundle.X.shape[0] != val_bundle.y.shape[0]:
+            raise RuntimeError("Validation feature/label row mismatch.")
+        return train_bundle, val_bundle
 
-# Track eval history automatically
-model.set_params(early_stopping_rounds=EARLY_STOP,
-                 callbacks=[TQDMCallback(total=params["n_estimators"])])
+    def _build_model(self, y_train: np.ndarray):
+        params = dict(self.cfg.xgb_params or {})
+        callbacks = [TQDMCallback(total=int(params["n_estimators"]))]
 
-# ------------ Train ------------
-logger.info("Starting training...")
-start = time.time()
-model.fit(
-    X_train, y_train,
-    eval_set=[(X_train, y_train), (X_val, y_val)],   # track both
-    verbose=VERBOSE_EVAL
-)
-best_iter = getattr(model, "best_iteration", None)
-elapsed_min = (time.time() - start) / 60.0
-logger.info(f"Done in {elapsed_min:.2f} min | best_iteration={best_iter}")
+        if self.spec.role == "classifier":
+            pos = int((y_train == 1).sum())
+            neg = int((y_train == 0).sum())
+            params["scale_pos_weight"] = neg / max(1, pos)
+            model = xgb.XGBClassifier(**params)
+            self.logger.info(
+                "Classifier setup | positives=%d negatives=%d scale_pos_weight=%.4f",
+                pos,
+                neg,
+                float(params["scale_pos_weight"]),
+            )
+        else:
+            model = xgb.XGBRegressor(**params)
+            self.logger.info("Regressor setup | objective=%s", params.get("objective"))
 
-# ------------ Save eval history (loss tracking) ------------
-evals_result = model.evals_result()
-# Build a tidy DataFrame
-hist = pd.DataFrame({
-    "iter": np.arange(len(next(iter(evals_result.values()))["validation_0"])),
-})
-for name, logs in evals_result.items():
-    for metric, series in logs.items():
-        hist[f"{name}.{metric}"] = series
-hist.to_csv(HIST_PATH, index=False)
-logger.info(f"Saved eval history -> {HIST_PATH}")
+        model.set_params(
+            early_stopping_rounds=self.cfg.early_stop,
+            callbacks=callbacks,
+        )
+        return model
 
-# Plot curves
-plt.figure(figsize=(8,6))
-for col in hist.columns:
-    if col == "iter": continue
-    plt.plot(hist["iter"], hist[col], label=col)
-plt.xlabel("Iteration"); plt.ylabel("Metric")
-plt.title(f"XGBoost training history ({task_suffix})")
-plt.legend(); plt.grid(True, alpha=0.3)
-plt.tight_layout(); plt.savefig(CURVE_PATH)
-logger.info(f"Saved curves -> {CURVE_PATH}")
+    def train(self, train_bundle, val_bundle):
+        model = self._build_model(train_bundle.y)
+        self.logger.info("Training mode=%s", self.cfg.mode)
+        start = time.time()
+        model.fit(
+            train_bundle.X,
+            train_bundle.y,
+            eval_set=[(val_bundle.X, val_bundle.y)],
+            verbose=self.cfg.verbose_eval,
+        )
+        elapsed = (time.time() - start) / 60.0
+        self.logger.info("Training complete in %.2f min | best_iteration=%s", elapsed, getattr(model, "best_iteration", None))
+        self.model = model
+        return model
 
-# ------------ Evaluate ------------
-if TASK=="binary":
-    probs = model.predict_proba(X_val)[:, 1]
-    auroc = roc_auc_score(y_val, probs)
-    auprc = average_precision_score(y_val, probs)
-    preds05 = (probs >= 0.5).astype(int)
-    logger.info(f"[VAL] AUROC={auroc:.4f} | AUPRC={auprc:.4f}")
-    logger.info(f"[VAL @0.5] Acc={accuracy_score(y_val, preds05):.4f} "
-                f"Prec={precision_score(y_val, preds05, zero_division=0):.4f} "
-                f"Rec={recall_score(y_val, preds05, zero_division=0):.4f} "
-                f"F1={f1_score(y_val, preds05, zero_division=0):.4f}")
-    best = pick_precision_threshold(probs, y_val, TARGET_PRECISION, MIN_RECALL)
-    logger.info(f"[VAL @PrecOpt {best['thr']:.2f}] Prec={best['p']:.4f} Rec={best['r']:.4f} F1={best['f1']:.4f}")
-    if SAVE_PRECISION_OPT_THR:
-        with open(THRESHOLD_PATH, "w") as f:
-            json.dump({"decision_threshold": best["thr"],
-                       "precision": best["p"],
-                       "recall": best["r"],
-                       "f1": best["f1"]}, f, indent=2)
-        logger.info(f"Saved threshold -> {THRESHOLD_PATH}")
-else:
-    preds = model.predict(X_val)
-    rmse = mean_squared_error(y_val, preds, squared=False)
-    r2   = r2_score(y_val, preds)
-    logger.info(f"[VAL] RMSE={rmse:.4f} | R²={r2:.4f}")
+    def evaluate(self, val_bundle):
+        if self.spec.role == "classifier":
+            probs = self.model.predict_proba(val_bundle.X)[:, 1]
+            metrics = compute_binary_metrics(
+                val_bundle.y.astype(int),
+                probs,
+                target_precision=self.cfg.target_precision,
+                min_recall=self.cfg.min_recall,
+            )
+            self.val_predictions = probs
+            self.logger.info(
+                "[VAL] AUPRC=%.4f | AUROC=%.4f | F1@0.5=%.4f | F1*=%.4f @ thr=%.4f",
+                metrics["auprc"],
+                metrics["auroc"],
+                metrics["f1_05"],
+                metrics["f1_opt"],
+                metrics["thr_opt"],
+            )
+        else:
+            raw_preds = self.model.predict(val_bundle.X)
+            preds = to_raw_count_predictions(raw_preds, self.spec)
+            metrics = compute_count_metrics(
+                val_bundle.y_raw.astype(float),
+                preds,
+                positive_mask=val_bundle.y_raw.astype(float) > 0,
+            )
+            self.val_predictions = preds
+            self.val_model_outputs = raw_preds
+            self.logger.info(
+                "[VAL] RMSE=%.4f | MAE=%.4f | R2=%.4f | PosRMSE=%.4f | PosMAE=%.4f",
+                metrics["rmse"],
+                metrics["mae"],
+                metrics["r2"],
+                metrics["positive_only_rmse"],
+                metrics["positive_only_mae"],
+            )
+        return metrics
 
-# ------------ Save model & importance ------------
-model.save_model(MODEL_PATH)
-logger.info(f"Saved model -> {MODEL_PATH}")
+    def save_artifacts(self, train_bundle, val_bundle, metrics):
+        model_path = checkpoint_path(self.cfg.out_dir, self.cfg.mode)
+        self.model.save_model(model_path)
+        model_sha = sha256_file(model_path)
+        self.logger.info("Saved model -> %s (SHA256=%s...)", model_path, model_sha[:8])
 
-plt.figure(figsize=(8,6))
-xgb.plot_importance(model, importance_type="gain", max_num_features=20, height=0.5)
-plt.tight_layout(); plt.savefig(IMPLOT_PATH)
-logger.info(f"Saved feature importance -> {IMPLOT_PATH}")
+        fi_path = save_feature_importance_plot(self.model, self.cfg.out_dir, self.spec.checkpoint_stem)
+        self.logger.info("Saved feature importance -> %s", fi_path)
+
+        metadata = {
+            "config": asdict(self.cfg),
+            "mode": default_model_metadata(self.cfg.mode),
+            "model_path": model_path,
+            "model_sha256": model_sha,
+            "feature_importance_plot": fi_path,
+            "rows": {
+                "train": int(train_bundle.frame.shape[0]),
+                "val": int(val_bundle.frame.shape[0]),
+            },
+            "metrics_val": metrics,
+        }
+        meta_path = save_checkpoint_metadata(self.cfg.out_dir, self.cfg.mode, metadata)
+        self.logger.info("Saved model metadata -> %s", meta_path)
+
+        if self.spec.role == "classifier" and self.cfg.save_precision_thr:
+            thr_payload = {
+                "mode": self.cfg.mode,
+                "threshold": float(metrics["thr_opt"]),
+                "precision": float(metrics["prec_opt"]),
+                "recall": float(metrics["rec_opt"]),
+                "f1": float(metrics["f1_opt"]),
+                "auprc": float(metrics["auprc"]),
+                "auroc": float(metrics["auroc"]),
+            }
+            thr_path = threshold_path(self.cfg.out_dir, self.cfg.mode)
+            save_json(thr_path, thr_payload)
+            self.logger.info("Saved threshold metadata -> %s", thr_path)
+
+        pred_path = prediction_csv_path(self.cfg.out_dir, self.cfg.mode, "val")
+        pred_df = val_bundle.frame.loc[:, ["review_id"]].copy()
+        if self.spec.role == "classifier":
+            pred_df["true_label"] = val_bundle.y.astype(int)
+            pred_df["prob_pos"] = self.val_predictions
+            pred_df["pred_05"] = (self.val_predictions >= 0.5).astype(int)
+            pred_df["pred_opt"] = (self.val_predictions >= metrics["thr_opt"]).astype(int)
+        else:
+            pred_df["y_true"] = val_bundle.y_raw.astype(float)
+            pred_df["y_pred"] = self.val_predictions
+            pred_df["model_output"] = self.val_model_outputs
+        pred_df.to_csv(pred_path, index=False)
+        self.logger.info("Saved validation predictions -> %s", pred_path)
+
+
+def xgb_train_file_handler(log_path: str):
+    handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    return handler
+
+
+def parse_args() -> XGBConfig:
+    parser = argparse.ArgumentParser(description="Train XGBoost models for binary and count tasks.")
+    parser.add_argument(
+        "--mode",
+        choices=["binary", "count_stage1", "count_stage2_poisson", "count_stage2_log1p"],
+        default="binary",
+    )
+    parser.add_argument("--base-dir", default=str(ROOT / "datasets" / "preprocessed"))
+    parser.add_argument("--out-dir", default=str(ROOT / "outputs"))
+    parser.add_argument("--early-stop", type=int, default=300)
+    parser.add_argument("--verbose-eval", type=int, default=50)
+    parser.add_argument("--target-precision", type=float, default=0.30)
+    parser.add_argument("--min-recall", type=float, default=0.15)
+    parser.add_argument("--random-seed", type=int, default=42)
+    args = parser.parse_args()
+
+    return XGBConfig(
+        mode=args.mode,
+        base_dir=args.base_dir,
+        out_dir=args.out_dir,
+        early_stop=args.early_stop,
+        verbose_eval=args.verbose_eval,
+        target_precision=args.target_precision,
+        min_recall=args.min_recall,
+        random_seed=args.random_seed,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    trainer = XGBTrainer(cfg)
+    train_bundle, val_bundle = trainer.load_data()
+    trainer.train(train_bundle, val_bundle)
+    metrics = trainer.evaluate(val_bundle)
+    trainer.save_artifacts(train_bundle, val_bundle, metrics)
+
+
+if __name__ == "__main__":
+    main()

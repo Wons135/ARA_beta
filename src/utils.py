@@ -1,54 +1,128 @@
 # src/utils.py
+"""
+Utility functions and lightweight helpers used across model training/evaluation.
+Refactored (Strategy 2) for:
+  • Backbone-agnostic freezing (BERT, RoBERTa, DistilBERT, etc.)
+  • Stable param grouping with no-decay handling
+  • EMA robust to (un)freezing
+  • Vectorized precision-threshold selection
+  • Safer autocast and logging
+"""
+from __future__ import annotations
+import math
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import precision_score, recall_score, f1_score
-from torch import nn
+from sklearn.metrics import precision_recall_curve
+from typing import Any, Dict, List, Tuple
 
-# ----------------------------
-# (Un)freeze helpers
-# ----------------------------
-def set_freeze_depth(model, freeze_layers: int):
+
+# ----------------------------------------------------------------------
+# Backbone introspection and freeze helpers
+# ----------------------------------------------------------------------
+class BackboneIntrospector:
+    """Detect encoder/embedding layers in common Transformer variants."""
+
+    @staticmethod
+    def encoder_layers(model: nn.Module):
+        for attr in ["transformer", "encoder"]:
+            enc = getattr(getattr(model, "bert", None), attr, None)
+            if enc is not None and hasattr(enc, "layer"):
+                return enc.layer
+        return None
+
+    @staticmethod
+    def embedding_module(model: nn.Module):
+        for name in ["embeddings", "Embeddings"]:
+            if hasattr(getattr(model, "bert", None), name):
+                return getattr(model.bert, name)
+        return None
+
+    @staticmethod
+    def pooler_module(model: nn.Module):
+        if hasattr(getattr(model, "bert", None), "pooler"):
+            return model.bert.pooler
+        return None
+
+
+def set_freeze_depth(
+    model: nn.Module,
+    freeze_layers: int,
+    freeze_embed: bool = True,
+    freeze_pooler: bool = False,
+):
+    """
+    Freeze early encoder layers (and optionally embeddings/pooler).
+
+    freeze_layers: number of initial encoder blocks to freeze.
+    freeze_embed : freeze token embeddings.
+    freeze_pooler: freeze pooler head if present.
+    """
     if not hasattr(model, "bert"):
         return
-    # DeBERTa-style
-    if hasattr(model.bert, "transformer") and hasattr(model.bert.transformer, "layer"):
-        layers = model.bert.transformer.layer
-        L = len(layers); freeze_layers = max(0, min(freeze_layers, L))
-        for i, layer in enumerate(layers):
-            req = (i < freeze_layers)
-            for p in layer.parameters():
-                p.requires_grad = (not req)
-        return
-    # BERT/RoBERTa-style
-    if hasattr(model.bert, "encoder") and hasattr(model.bert.encoder, "layer"):
-        layers = model.bert.encoder.layer
-        L = len(layers); freeze_layers = max(0, min(freeze_layers, L))
-        for i, layer in enumerate(layers):
-            req = (i < freeze_layers)
-            for p in layer.parameters():
-                p.requires_grad = (not req)
-        return
 
-def build_param_groups(model, base_lr: float, head_lr: float,
-                       weight_decay: float, head_weight_decay: float):
-    enc_params, head_params = [], []
+    layers = BackboneIntrospector.encoder_layers(model)
+    if layers is not None:
+        L = len(layers)
+        freeze_layers = max(0, min(freeze_layers, L))
+        for i, layer in enumerate(layers):
+            req = (i < freeze_layers)
+            for p in layer.parameters():
+                p.requires_grad = not req
+
+    if freeze_embed:
+        emb = BackboneIntrospector.embedding_module(model)
+        if emb is not None:
+            for p in emb.parameters():
+                p.requires_grad = False
+
+    if freeze_pooler:
+        pool = BackboneIntrospector.pooler_module(model)
+        if pool is not None:
+            for p in pool.parameters():
+                p.requires_grad = False
+
+
+# ----------------------------------------------------------------------
+# Parameter grouping with no-decay
+# ----------------------------------------------------------------------
+def build_param_groups(
+    model: nn.Module,
+    base_lr: float,
+    head_lr: float,
+    weight_decay: float,
+    head_weight_decay: float,
+) -> List[Dict[str, Any]]:
+    """
+    Separate encoder vs head parameters and exclude biases/LayerNorm weights from weight decay.
+    """
+    enc_params_decay, enc_params_no_decay = [], []
+    head_params_decay, head_params_no_decay = [], []
+
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if name.startswith("bert."):
-            enc_params.append(p)
+        is_no_decay = any(nd in name.lower() for nd in ["bias", "norm", "bn"])
+        is_encoder = name.startswith("bert.") or name.startswith("roberta.") or name.startswith("distilbert.")
+
+        if is_encoder:
+            (enc_params_no_decay if is_no_decay else enc_params_decay).append(p)
         else:
-            head_params.append(p)
+            (head_params_no_decay if is_no_decay else head_params_decay).append(p)
+
     return [
-        {"params": enc_params, "lr": base_lr, "weight_decay": weight_decay},
-        {"params": head_params, "lr": head_lr, "weight_decay": head_weight_decay},
+        {"params": enc_params_decay, "lr": base_lr, "weight_decay": weight_decay},
+        {"params": enc_params_no_decay, "lr": base_lr, "weight_decay": 0.0},
+        {"params": head_params_decay, "lr": head_lr, "weight_decay": head_weight_decay},
+        {"params": head_params_no_decay, "lr": head_lr, "weight_decay": 0.0},
     ]
 
-# ----------------------------
-# R-Drop loss (binary CE + symmetric KL)
-# ----------------------------
-def rdrop_ce_loss(logits1, logits2, targets, criterion, alpha=1.0):
+
+# ----------------------------------------------------------------------
+# R-Drop loss
+# ----------------------------------------------------------------------
+def rdrop_ce_loss(logits1, logits2, targets, criterion, alpha: float = 1.0):
     ce1 = criterion(logits1.float(), targets.long())
     ce2 = criterion(logits2.float(), targets.long())
     ce = 0.5 * (ce1 + ce2)
@@ -59,90 +133,87 @@ def rdrop_ce_loss(logits1, logits2, targets, criterion, alpha=1.0):
     q = q_log.exp()
     kl1 = F.kl_div(p_log, q, reduction="batchmean")
     kl2 = F.kl_div(q_log, p, reduction="batchmean")
-    kl = 0.5 * (kl1 + kl2)
-    return ce + alpha * kl
+    return ce + alpha * 0.5 * (kl1 + kl2)
 
-# ----------------------------
-# EMA (robust to unfreezing/rollback)
-# ----------------------------
+
+# ----------------------------------------------------------------------
+# EMA robust to (un)freezing
+# ----------------------------------------------------------------------
 class EMA:
-    def __init__(self, model, decay=0.999):
+    def __init__(self, model: nn.Module, decay: float = 0.999, device: str | None = None):
         self.decay = decay
-        self.shadow = {}
-        self.backup = {}
+        self.shadow: Dict[str, torch.Tensor] = {}
+        self.backup: Dict[str, torch.Tensor] = {}
+        self.device = device or next(model.parameters()).device
         self._init_from_model(model)
 
     @torch.no_grad()
-    def _init_from_model(self, model):
+    def _init_from_model(self, model: nn.Module):
         self.shadow.clear()
         for name, p in model.named_parameters():
-            if p.requires_grad:
-                self.shadow[name] = p.detach().clone()
+            self.shadow[name] = p.detach().clone().to(self.device)
 
     @torch.no_grad()
-    def update(self, model):
+    def update(self, model: nn.Module):
         for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
             if name not in self.shadow:
-                self.shadow[name] = p.detach().clone()
+                self.shadow[name] = p.detach().clone().to(self.device)
             else:
-                self.shadow[name].mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+                self.shadow[name].mul_(self.decay).add_(p.detach().to(self.device), alpha=1 - self.decay)
 
     @torch.no_grad()
-    def apply_shadow(self, model):
-        self.backup = {}
+    def apply_shadow(self, model: nn.Module):
+        self.backup.clear()
         for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
             if name in self.shadow:
                 self.backup[name] = p.detach().clone()
                 p.data.copy_(self.shadow[name].data)
 
     @torch.no_grad()
-    def restore(self, model):
-        if not self.backup:
-            return
+    def restore(self, model: nn.Module):
         for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
             if name in self.backup:
                 p.data.copy_(self.backup[name].data)
-        self.backup = {}
+        self.backup.clear()
 
     @torch.no_grad()
-    def refresh_from_model(self, model):
-        """Call after rollback or (un)freeze changes."""
+    def refresh_from_model(self, model: nn.Module):
+        """Re-initialize shadow weights (e.g., after checkpoint rollback)."""
         self._init_from_model(model)
 
-# ----------------------------
+
+# ----------------------------------------------------------------------
 # AMP autocast helper
-# ----------------------------
+# ----------------------------------------------------------------------
 def autocast_context(device, use_amp: bool, amp_dtype: str):
     if not use_amp:
         return torch.autocast(device_type=device.type, dtype=torch.float32, enabled=False)
-    if amp_dtype.lower() == "bf16":
-        return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=True)
-    return torch.autocast(device_type=device.type, dtype=torch.float16, enabled=True)
+    dtype = torch.bfloat16 if amp_dtype.lower() == "bf16" else torch.float16
+    if device.type == "cpu" and dtype == torch.float16:
+        raise RuntimeError("fp16 autocast unsupported on CPU; use bf16 or disable AMP.")
+    return torch.autocast(device_type=device.type, dtype=dtype, enabled=True)
 
-# ----------------------------
-# Debug helper
-# ----------------------------
+
+# ----------------------------------------------------------------------
+# Debug helpers
+# ----------------------------------------------------------------------
 @torch.no_grad()
 def maybe_print_batch_stats(logger, outputs, targets, tag):
     o = outputs.detach().float()
     t = targets.detach().float()
     if torch.isfinite(o).any() and torch.isfinite(t).any():
         logger.warning(
-            f"{tag} stats | outputs: min={o.min().item():.3f} max={o.max().item():.3f} mean={o.mean().item():.3f} | "
-            f"targets: min={t.min().item():.3f} max={t.max().item():.3f} mean={t.mean().item():.3f}"
+            "%s stats | outputs: min=%.3f max=%.3f mean=%.3f | targets: min=%.3f max=%.3f mean=%.3f",
+            tag, o.min().item(), o.max().item(), o.mean().item(),
+            t.min().item(), t.max().item(), t.mean().item()
         )
 
+
+# ----------------------------------------------------------------------
+# Asymmetric Focal Loss
+# ----------------------------------------------------------------------
 class AsymmetricFocalLoss(nn.Module):
-    """
-    Binary softmax version (2 logits per sample).
-    Emphasizes hard negatives via gamma_neg, which typically improves precision.
-    """
+    """Binary softmax version. Emphasizes hard negatives via gamma_neg."""
     def __init__(self, alpha_pos=0.5, gamma_pos=0.0, gamma_neg=2.0, eps=1e-8):
         super().__init__()
         self.alpha_pos = alpha_pos
@@ -152,59 +223,46 @@ class AsymmetricFocalLoss(nn.Module):
         self.eps = eps
 
     def forward(self, logits, targets):
-        # logits: (B,2), targets: (B,)
         probs = torch.softmax(logits, dim=1).clamp(self.eps, 1.0 - self.eps)
-        p_pos = probs[:, 1]
-        p_neg = probs[:, 0]
+        p_pos, p_neg = probs[:, 1], probs[:, 0]
         t = targets.long()
-
-        # select p_t and alpha_t per class
         p_t = torch.where(t == 1, p_pos, p_neg)
         alpha_t = torch.where(t == 1,
                               torch.full_like(p_pos, self.alpha_pos),
                               torch.full_like(p_neg, self.alpha_neg))
-        # asymmetric focusing
         gamma_t = torch.where(t == 1,
                               torch.full_like(p_pos, self.gamma_pos),
                               torch.full_like(p_neg, self.gamma_neg))
         focal = (1.0 - p_t) ** gamma_t
         ce = -torch.log(p_t)
-        loss = alpha_t * focal * ce
-        return loss.mean()
+        return (alpha_t * focal * ce).mean()
 
 
-def pick_precision_threshold(probs, labels, target_prec=0.3, min_recall=0.15):
+# ----------------------------------------------------------------------
+# Precision-targeted threshold selection (vectorized)
+# ----------------------------------------------------------------------
+def pick_precision_threshold(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    target_prec: float = 0.3,
+    min_recall: float = 0.15
+) -> Tuple[float, float, float, float]:
     """
-    Returns (best_thr, best_prec, best_rec, best_f1) under the constraints:
-      precision >= target_prec and recall >= min_recall.
-    If no threshold satisfies, fall back to the overall best F1 threshold.
+    Returns (best_thr, precision, recall, f1)
+    satisfying precision >= target_prec and recall >= min_recall.
+    Falls back to best-F1 if constraints not met.
     """
-    thrs = np.linspace(0.05, 0.95, 19)
-    best = (0.5, 0.0, 0.0, 0.0)  # thr, prec, rec, f1
-    # candidate pool: satisfying constraints, maximize precision; tie-break by F1
-    candidates = []
-    for thr in thrs:
-        preds = (probs >= thr).astype(int)
-        prec = precision_score(labels, preds, zero_division=0)
-        rec  = recall_score(labels, preds, zero_division=0)
-        f1v  = f1_score(labels, preds, zero_division=0)
-        if (prec >= target_prec) and (rec >= min_recall):
-            candidates.append((thr, prec, rec, f1v))
+    probs = np.nan_to_num(probs.astype(float))
+    labels = labels.astype(int)
 
-    if candidates:
-        # sort by precision desc, then F1 desc
-        candidates.sort(key=lambda x: (x[1], x[3]), reverse=True)
-        return candidates[0]
+    precs, recs, thrs = precision_recall_curve(labels, probs)
+    f1s = 2 * precs * recs / np.maximum(precs + recs, 1e-12)
+
+    mask = (precs >= target_prec) & (recs >= min_recall)
+    if np.any(mask[:-1]):
+        idx = int(np.nanargmax(f1s[:-1] * mask[:-1]))
     else:
-        # fallback: best F1
-        f1s = []
-        for thr in thrs:
-            preds = (probs >= thr).astype(int)
-            f1s.append(f1_score(labels, preds, zero_division=0))
-        i = int(np.argmax(f1s))
-        thr = float(thrs[i])
-        preds = (probs >= thr).astype(int)
-        prec = precision_score(labels, preds, zero_division=0)
-        rec  = recall_score(labels, preds, zero_division=0)
-        f1v  = f1s[i]
-        return (thr, prec, rec, f1v)
+        idx = int(np.nanargmax(f1s[:-1]))
+
+    best_thr = float(thrs[max(0, min(idx, len(thrs) - 1))])
+    return float(best_thr), float(precs[idx]), float(recs[idx]), float(f1s[idx])
