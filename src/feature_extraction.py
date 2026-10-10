@@ -23,10 +23,12 @@ from textblob import TextBlob
 from tqdm import tqdm
 import joblib
 
+ROOT = Path(__file__).resolve().parents[1]
+
 # =============================
 # CONFIG (defaults; can be overridden via CLI)
 # =============================
-TASK = "regression"  # "regression" | "binary"
+TASK = "binary"  # "regression" | "binary"
 
 # ---- Speed knobs ----
 USE_TEXTBLOB = False
@@ -57,13 +59,25 @@ RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
 # Paths (defaults; canonicalized later)
-BASE_PATH  = "../datasets/preprocessed"
-PLOTS_DIR  = "../outputs/plots"
-MODEL_PATH = "../outputs/feature_models"
+BASE_PATH  = str(ROOT / "datasets" / "preprocessed")
+PLOTS_DIR  = str(ROOT / "outputs" / "plots")
+MODEL_PATH = str(ROOT / "outputs" / "feature_models")
 
 task_to_label_column = {"regression": "regression_score", "binary": "binary_label"}
 
-AUX_COLS = ["sentiment_score", "review_length", "is_verified", "timestamp_recency_days"]
+BINARY_AUX_COLS = ["sentiment_score", "review_length", "is_verified", "timestamp_recency_days"]
+REGRESSION_AUX_COLS = [
+    "review_age_days",
+    "review_length",
+    "sentiment_score",
+    "is_verified",
+    "rating",
+    "log1p_review_length",
+    "log1p_review_age_days",
+    "abs_sentiment_score",
+    "rating_extremity",
+]
+TASK_AUX_COLS = {"binary": BINARY_AUX_COLS, "regression": REGRESSION_AUX_COLS}
 
 # =============================
 # Logging & safety
@@ -158,6 +172,95 @@ def compute_sentiment_series(text_series: pd.Series, logger: logging.LoggerAdapt
     logger.info("Computed TextBlob sentiment.")
     return pd.Series(scores, index=text_series.index)
 
+
+def word_count_series(text_series: pd.Series) -> pd.Series:
+    return text_series.astype(str).str.split().str.len().fillna(0).astype(np.float32)
+
+
+def image_presence_series(images_series: pd.Series) -> pd.Series:
+    values = images_series.fillna("").astype(str).str.strip()
+    return (~values.isin(["", "[]", "{}", "nan", "None"])).astype(np.float32)
+
+
+def numeric_series(df: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series(default, index=df.index, dtype=np.float32)
+    return pd.to_numeric(df[column], errors="coerce").astype(np.float32)
+
+
+def build_aux_feature_frame(
+    df: pd.DataFrame,
+    *,
+    task: str,
+    task_suffix: str,
+    is_train: bool,
+    model_dir: Path,
+    allow_untrusted: bool,
+    text_series: pd.Series,
+    logger: logging.LoggerAdapter,
+) -> pd.DataFrame:
+    aux_cols = TASK_AUX_COLS[task]
+
+    if task == "binary":
+        feats = pd.DataFrame(index=df.index)
+        feats["sentiment_score"] = numeric_series(df, "sentiment_score", default=0.0).fillna(0.0).astype(np.float32)
+        review_length = numeric_series(df, "review_length", default=0.0).fillna(0.0).astype(np.float32)
+        feats["review_length"] = np.log1p(review_length)
+        feats["is_verified"] = numeric_series(df, "is_verified", default=0.0).fillna(0.0).astype(np.float32)
+        feats["timestamp_recency_days"] = numeric_series(df, "timestamp_recency_days", default=-1.0).fillna(-1.0).astype(np.float32)
+        return feats[aux_cols].astype(np.float32)
+
+    prep_meta_path = model_dir / f"aux_prep_{task_suffix}.pkl"
+
+    review_age = numeric_series(df, "review_age_days", default=np.nan)
+    review_length = numeric_series(df, "review_length", default=0.0).fillna(0.0)
+    sentiment = numeric_series(df, "sentiment_score", default=0.0).fillna(0.0)
+    is_verified = numeric_series(df, "is_verified", default=0.0).fillna(0.0)
+    rating = numeric_series(df, "rating", default=0.0).fillna(0.0)
+
+    if is_train:
+        valid_age = review_age.dropna()
+        age_fill = float(valid_age.median()) if not valid_age.empty else 0.0
+        age_cap = float(valid_age.quantile(0.995)) if not valid_age.empty else 0.0
+        length_cap = float(review_length.quantile(0.995)) if not review_length.empty else 0.0
+        sentiment_cap = float(sentiment.abs().quantile(0.995)) if not sentiment.empty else 1.0
+        rating_midpoint = 3.0
+        prep_meta = {
+            "age_fill": age_fill,
+            "age_cap": max(age_fill, age_cap),
+            "length_cap": max(1.0, length_cap),
+            "sentiment_cap": max(0.1, sentiment_cap),
+            "rating_midpoint": rating_midpoint,
+            "aux_cols": aux_cols,
+        }
+        joblib.dump(prep_meta, prep_meta_path)
+    else:
+        if not allow_untrusted:
+            ensure_under(model_dir, prep_meta_path)
+        prep_meta = joblib.load(prep_meta_path)
+
+    age_fill = float(prep_meta["age_fill"])
+    age_cap = float(prep_meta["age_cap"])
+    length_cap = float(prep_meta["length_cap"])
+    sentiment_cap = float(prep_meta["sentiment_cap"])
+    rating_midpoint = float(prep_meta["rating_midpoint"])
+
+    review_age_filled = review_age.fillna(age_fill).clip(lower=0.0, upper=age_cap).astype(np.float32)
+    review_length_capped = review_length.clip(lower=0.0, upper=length_cap).astype(np.float32)
+    sentiment_capped = sentiment.clip(lower=-sentiment_cap, upper=sentiment_cap).astype(np.float32)
+
+    feats = pd.DataFrame(index=df.index)
+    feats["review_age_days"] = review_age_filled
+    feats["review_length"] = review_length_capped
+    feats["sentiment_score"] = sentiment_capped
+    feats["is_verified"] = is_verified.astype(np.float32)
+    feats["rating"] = rating.astype(np.float32)
+    feats["log1p_review_length"] = np.log1p(review_length_capped).astype(np.float32)
+    feats["log1p_review_age_days"] = np.log1p(review_age_filled).astype(np.float32)
+    feats["abs_sentiment_score"] = np.abs(sentiment_capped).astype(np.float32)
+    feats["rating_extremity"] = np.abs(rating.astype(np.float32) - rating_midpoint).astype(np.float32)
+    return feats[aux_cols].astype(np.float32)
+
 # =============================
 # Streamed SVD helper (.npy with header)
 # =============================
@@ -206,6 +309,8 @@ def extract_features(
     n = len(df)
     label_column = task_to_label_column[task]
     task_suffix = "regression" if task == "regression" else "binary"
+    aux_cols = TASK_AUX_COLS[task]
+    preserve_aux_outside_svd = (task == "regression" and APPLY_DIM_REDUCTION)
     logger.info(f"=== Extracting features ({split.upper()}) on {n:,} rows ===")
 
     txt = df[text_column].fillna("")
@@ -254,23 +359,16 @@ def extract_features(
     # ---------- AUX features ----------
     logger.info("AUX features: sentiment/length/flags/recency…")
     t0 = time.time()
-    feats = pd.DataFrame(index=df.index)
-    feats["sentiment_score"] = compute_sentiment_series(txt, logger)
-    # batched review length
-    feats["review_length"] = 0.0
-    for i in tqdm(range(0, n, SENT_BATCH), desc="Review length", unit="batch"):
-        j = min(i+SENT_BATCH, n)
-        feats.iloc[i:j, feats.columns.get_loc("review_length")] = [
-            float(len(s.split())) for s in txt.iloc[i:j].astype(str).values
-        ]
-    feats["is_verified"] = (df["is_verified"].astype(float) if "is_verified" in df.columns else 0.0)
-    if "timestamp" in df.columns:
-        t0_days = to_days(df["timestamp"]).min()
-        feats["timestamp_recency_days"] = to_days(df["timestamp"]) - t0_days
-    else:
-        feats["timestamp_recency_days"] = 0.0
-    feats["review_length"] = np.log1p(feats["review_length"].astype(float))
-    feats = feats[AUX_COLS].astype(np.float32)
+    feats = build_aux_feature_frame(
+        df,
+        task=task,
+        task_suffix=task_suffix,
+        is_train=is_train,
+        model_dir=model_dir,
+        allow_untrusted=allow_untrusted,
+        text_series=txt,
+        logger=logger,
+    )
     logger.info(f"AUX compute in {time.time()-t0:.1f}s")
 
     # ---------- Scale AUX ----------
@@ -282,7 +380,7 @@ def extract_features(
     if is_train:
         scaled_aux = scaler.fit_transform(feats.values)
         joblib.dump(scaler, scaler_path)
-        joblib.dump({"aux_cols": AUX_COLS}, aux_meta_path)
+        joblib.dump({"aux_cols": aux_cols}, aux_meta_path)
     else:
         if not allow_untrusted:
             ensure_under(model_dir, scaler_path)
@@ -319,15 +417,50 @@ def extract_features(
 
     # ---------- Dimensionality reduction (streamed to .npy) ----------
     if APPLY_DIM_REDUCTION:
-        n_comp = min(NUM_SVD_COMPONENTS, max(1, combined.shape[1] - 1))
+        svd_source = tfidf_matrix if preserve_aux_outside_svd else combined
+        n_comp = min(NUM_SVD_COMPONENTS, max(1, svd_source.shape[1] - 1))
         logger.info(f"SVD (TruncatedSVD → .npy memmap, n_components={n_comp})…")
         tsvd = time.time()
         out_path = base_path / f"X_{split}_features_{task_suffix}_svd.npy"
-        svd_fit_and_transform_to_memmap(
-            combined, n_comp, out_path, is_train=is_train,
-            model_dir=model_dir, task_suffix=task_suffix,
-            allow_untrusted=allow_untrusted, logger=logger
-        )
+        if preserve_aux_outside_svd:
+            text_only_path = base_path / f"X_{split}_text_features_{task_suffix}_svd.npy"
+            svd_fit_and_transform_to_memmap(
+                tfidf_matrix,
+                n_comp,
+                text_only_path,
+                is_train=is_train,
+                model_dir=model_dir,
+                task_suffix=task_suffix,
+                allow_untrusted=allow_untrusted,
+                logger=logger,
+            )
+            reduced_text = np.load(text_only_path, mmap_mode="r")
+            aux_dim = scaled_aux.shape[1]
+            mm = open_memmap(
+                out_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(n, aux_dim + reduced_text.shape[1]),
+            )
+            for start in range(0, n, SVD_BATCH_ROWS):
+                end = min(start + SVD_BATCH_ROWS, n)
+                mm[start:end, :aux_dim] = scaled_aux[start:end].astype(np.float32, copy=False)
+                mm[start:end, aux_dim:] = reduced_text[start:end]
+            del mm
+            del reduced_text
+            try:
+                text_only_path.unlink()
+            except OSError:
+                logger.warning(f"Could not remove temporary SVD artifact: {text_only_path}")
+            logger.info(
+                f"Preserved {aux_dim} structured metadata features outside SVD; final shape=({n}, {aux_dim + n_comp})"
+            )
+        else:
+            svd_fit_and_transform_to_memmap(
+                combined, n_comp, out_path, is_train=is_train,
+                model_dir=model_dir, task_suffix=task_suffix,
+                allow_untrusted=allow_untrusted, logger=logger
+            )
         logger.info(f"SVD stream in {time.time()-tsvd:.1f}s -> saved: {out_path}")
         logger.info(f"=== Done ({split.upper()}) in {time.time()-stage_t0:.1f}s ===")
         return str(out_path)
@@ -418,6 +551,17 @@ def main():
     val_path_out   = _maybe_save_sparse_or_npy(X_val,   "val")
     test_path_out  = _maybe_save_sparse_or_npy(X_test,  "test")
 
+    def _save_feature_ids(df: pd.DataFrame, split: str) -> str:
+        if "review_id" not in df.columns:
+            raise ValueError(f"Missing required 'review_id' column for split='{split}'")
+        out = base_path / f"X_{split}_feature_ids_{task_suffix}.csv"
+        df.loc[:, ["review_id"]].to_csv(out, index=False)
+        return str(out)
+
+    train_ids_out = _save_feature_ids(train_df, "train")
+    val_ids_out   = _save_feature_ids(val_df, "val")
+    test_ids_out  = _save_feature_ids(test_df, "test")
+
     # Persist labels
     train_df[[label_column]].to_csv(base_path / f"y_train_{task_suffix}.csv", index=False)
     val_df[[label_column]].to_csv(  base_path / f"y_val_{task_suffix}.csv",   index=False)
@@ -427,15 +571,20 @@ def main():
     meta = {
         "task": task,
         "label_column": label_column,
+        "aux_cols": TASK_AUX_COLS[task],
+        "structured_metadata_preserved_outside_svd": bool(task == "regression" and APPLY_DIM_REDUCTION),
+        "num_structured_features": len(TASK_AUX_COLS[task]),
         "rows": {"train": int(train_df.shape[0]), "val": int(val_df.shape[0]), "test": int(test_df.shape[0])},
         "tfidf_backend": TFIDF_BACKEND,
         "tfidf_max_features": TFIDF_MAX_FEATURES,
         "tfidf_ngram_range": TFIDF_NGRAM_RANGE,
         "apply_feature_selection": APPLY_FEATURE_SELECTION,
         "num_svd_components": int(NUM_SVD_COMPONENTS) if APPLY_DIM_REDUCTION else None,
+        "feature_layout": "structured_metadata + text_svd" if (task == "regression" and APPLY_DIM_REDUCTION) else "combined_svd_or_sparse",
         "use_textblob": USE_TEXTBLOB,
         "sent_batch": SENT_BATCH,
-        "svd_outputs": {"train": train_path_out, "val": val_path_out, "test": test_path_out}
+        "svd_outputs": {"train": train_path_out, "val": val_path_out, "test": test_path_out},
+        "feature_id_outputs": {"train": train_ids_out, "val": val_ids_out, "test": test_ids_out},
     }
     with open(base_path / f"labels_meta_{task_suffix}.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)

@@ -20,7 +20,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils import clip_grad_norm_
 from transformers import get_cosine_schedule_with_warmup
-from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
+from training.bert_common import compute_binary_metrics
 
 # ------------------------- Utilities ------------------------- #
 
@@ -58,27 +58,48 @@ class EMA:
         self.register(model)
 
     def register(self, model: nn.Module):
-        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items() if v.dtype.is_floating_point}
+        self.shadow = {
+            k: v.detach().clone()
+            for k, v in model.state_dict().items()
+            if torch.is_tensor(v) and v.dtype.is_floating_point
+        }
 
     def update(self, model: nn.Module):
         with torch.no_grad():
             for k, v in model.state_dict().items():
                 if k in self.shadow:
-                    self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1.0 - self.decay)
+                    shadow = self.shadow[k]
+                    value = v.detach()
+                    if shadow.device != value.device or shadow.dtype != value.dtype:
+                        shadow = shadow.to(device=value.device, dtype=value.dtype)
+                        self.shadow[k] = shadow
+                    shadow.mul_(self.decay).add_(value, alpha=1.0 - self.decay)
 
     def apply(self, model: nn.Module) -> Dict[str, torch.Tensor]:
         self._backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
         new_state = {}
         for k, v in model.state_dict().items():
             if k in self.shadow:
-                new_state[k] = self.shadow[k].clone()
+                shadow = self.shadow[k]
+                if shadow.device != v.device or shadow.dtype != v.dtype:
+                    shadow = shadow.to(device=v.device, dtype=v.dtype)
+                    self.shadow[k] = shadow
+                new_state[k] = shadow.clone()
             else:
                 new_state[k] = v
         model.load_state_dict(new_state)
         return self._backup  # return backup for restore
 
     def restore(self, model: nn.Module, backup: Dict[str, torch.Tensor]):
-        model.load_state_dict(backup)
+        aligned_backup = {}
+        current_state = model.state_dict()
+        for k, v in backup.items():
+            current = current_state.get(k)
+            if torch.is_tensor(v) and torch.is_tensor(current) and (v.device != current.device or v.dtype != current.dtype):
+                aligned_backup[k] = v.to(device=current.device, dtype=current.dtype)
+            else:
+                aligned_backup[k] = v
+        model.load_state_dict(aligned_backup)
 
 # ------------------------- Config ------------------------- #
 
@@ -108,10 +129,11 @@ class TrainConfig:
     unfreeze_schedule: Mapping[int, int] = None  # type: ignore
     freeze_init: int = 4
     # Loss/metrics knobs
-    loss_kind: Literal["ce", "afl", "mse", "smooth"] = "ce"
+    loss_kind: Literal["bce", "ce", "afl", "mse", "smooth"] = "bce"
     ce_label_smooth: float = 0.01
     target_precision: float = 0.30
     min_recall: float = 0.15
+    selection_metric: Literal["auprc", "best_f1"] = "auprc"
     # EMA
     use_ema: bool = True
     ema_decay: float = 0.999
@@ -215,12 +237,38 @@ class Trainer:
         self.amp_was_disabled_this_epoch = False
         self.force_fp32_next_epoch = False
 
+    def _non_finite_tensor_keys(self, state: Mapping[str, Any]) -> List[str]:
+        bad: List[str] = []
+        for key, value in state.items():
+            if torch.is_tensor(value) and value.dtype.is_floating_point and not torch.isfinite(value).all():
+                bad.append(str(key))
+        return bad
+
+    def _instability_backoff(self) -> None:
+        for group in self.optimizer.param_groups:
+            group["lr"] = max(group["lr"] * self.cfg.lr_reduce_factor, self.cfg.lr_floor)
+
+    def _mark_amp_unstable(self, use_amp_now: bool) -> None:
+        if self.cfg.disable_amp_on_nan and use_amp_now:
+            self.amp_was_disabled_this_epoch = True
+
+    def _sample_bad_keys(self, bad_keys: List[str], limit: int = 5) -> str:
+        preview = bad_keys[:limit]
+        suffix = "" if len(bad_keys) <= limit else " ..."
+        return f"{preview}{suffix}"
+
     def _selection_metric_name(self) -> str:
-        return "auprc" if self.cfg.task == "binary" else "neg_val_loss"
+        if self.cfg.task == "binary":
+            return str(self.cfg.selection_metric)
+        return "neg_val_loss"
 
     def _selection_score(self, val_loss: float, metrics: Optional[Dict[str, float]]) -> float:
         if self.cfg.task == "binary":
-            return float(metrics.get("auprc", float("-inf")) if metrics is not None else float("-inf"))
+            if metrics is None:
+                return float("-inf")
+            if self.cfg.selection_metric == "best_f1":
+                return float(metrics.get("f1_opt", float("-inf")))
+            return float(metrics.get("auprc", float("-inf")))
         return float(-val_loss)
 
     def _checkpoint_payload(
@@ -232,8 +280,15 @@ class Trainer:
         decision_threshold: Optional[float] = None,
         epoch_idx: Optional[int] = None,
     ) -> Dict[str, Any]:
+        model_state = self.model.state_dict()
+        bad_keys = self._non_finite_tensor_keys(model_state)
+        if bad_keys:
+            raise ValueError(
+                "Refusing to save checkpoint with non-finite model parameters: "
+                f"{self._sample_bad_keys(bad_keys)}"
+            )
         payload: Dict[str, Any] = {
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": model_state,
             "task": self.cfg.task,
             "head_type": "classifier" if self.cfg.task == "binary" else "regressor",
             "checkpoint_role": checkpoint_role,
@@ -250,6 +305,34 @@ class Trainer:
         if self.cfg.checkpoint_extras:
             payload.update(dict(self.cfg.checkpoint_extras))
         return payload
+
+    def _history_path(self) -> Path:
+        return Path(self.cfg.logs_dir) / f"{self.cfg.task}_val_history.jsonl"
+
+    def _append_epoch_history(
+        self,
+        *,
+        epoch_idx: int,
+        train_loss: float,
+        val_loss: float,
+        metrics: Optional[Dict[str, float]],
+        selection_score: float,
+    ) -> None:
+        payload: Dict[str, Any] = {
+            "epoch": int(epoch_idx) + 1,
+            "train_loss": float(train_loss),
+            "val_loss": float(val_loss),
+            "selection_metric": self._selection_metric_name(),
+            "selection_score": float(selection_score),
+        }
+        if metrics is not None:
+            payload["metrics"] = {
+                str(key): float(value) if isinstance(value, (int, float, np.floating, np.integer)) else value
+                for key, value in metrics.items()
+            }
+        history_path = self._history_path()
+        with history_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload) + "\n")
 
     # ----------------- Checkpoint I/O ----------------- #
 
@@ -284,6 +367,26 @@ class Trainer:
         from contextlib import nullcontext
         return nullcontext()
 
+    def _binary_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        if logits.ndim == 2 and logits.shape[1] == 2:
+            return self.criterion(logits, targets.long())
+        if logits.ndim == 2 and logits.shape[1] == 1:
+            logits = logits.squeeze(-1)
+        if logits.ndim != 1:
+            raise ValueError(f"Unsupported binary logits shape: {tuple(logits.shape)}")
+        return self.criterion(logits, targets.float())
+
+    def _binary_probs(self, logits: torch.Tensor) -> torch.Tensor:
+        logits = logits.float()
+        if logits.ndim == 2 and logits.shape[1] == 2:
+            return torch.softmax(logits, dim=1)[:, 1]
+        if logits.ndim == 2 and logits.shape[1] == 1:
+            logits = logits.squeeze(-1)
+        if logits.ndim != 1:
+            raise ValueError(f"Unsupported binary logits shape: {tuple(logits.shape)}")
+        return torch.sigmoid(logits)
+
     def train_epoch(self, use_amp_now: bool, use_rdrop: bool, max_steps: Optional[int]) -> Tuple[float, int, bool]:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
@@ -301,8 +404,18 @@ class Trainer:
 
             with self._autocast(use_amp_now):
                 logits = self.model(input_ids, attention_mask, aux_features=aux)
-
-            logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4).clamp_(-self.logit_clamp, self.logit_clamp)
+            if not torch.isfinite(logits).all():
+                skips += 1
+                self.logger.warning("[TRAIN] Non-finite logits encountered at step %d. Skipping batch.", step)
+                self._mark_amp_unstable(use_amp_now)
+                self._instability_backoff()
+                self.optimizer.zero_grad(set_to_none=True)
+                if (skips / max(1, step)) > 0.50:
+                    self.logger.warning("[TRAIN] >50%% batches skipped; bailing epoch.")
+                    early_bail = True
+                    break
+                continue
+            logits = logits.clamp_(-self.logit_clamp, self.logit_clamp)
 
             if self.cfg.task == "regression":
                 loss = self.criterion(logits.float(), targets.float()) / self.cfg.grad_accum_steps
@@ -310,18 +423,26 @@ class Trainer:
                 if use_rdrop and self.rdrop_fn is not None and self.cfg.loss_kind == "ce":
                     with self._autocast(use_amp_now):
                         logits2 = self.model(input_ids, attention_mask, aux_features=aux)
-                    logits2 = torch.nan_to_num(logits2, nan=0.0, posinf=1e4, neginf=-1e4).clamp_(-self.logit_clamp, self.logit_clamp)
+                    if not torch.isfinite(logits2).all():
+                        skips += 1
+                        self.logger.warning("[TRAIN] Non-finite logits encountered in R-Drop pass at step %d. Skipping batch.", step)
+                        self._mark_amp_unstable(use_amp_now)
+                        self._instability_backoff()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        if (skips / max(1, step)) > 0.50:
+                            self.logger.warning("[TRAIN] >50%% batches skipped; bailing epoch.")
+                            early_bail = True
+                            break
+                        continue
+                    logits2 = logits2.clamp_(-self.logit_clamp, self.logit_clamp)
                     loss = self.rdrop_fn(logits, logits2, targets, self.criterion, alpha=0.5) / self.cfg.grad_accum_steps
                 else:
-                    loss = self.criterion(logits.float(), targets.long()) / self.cfg.grad_accum_steps
+                    loss = self._binary_loss(logits, targets) / self.cfg.grad_accum_steps
 
             if not torch.isfinite(loss):
                 skips += 1
-                if self.cfg.disable_amp_on_nan and use_amp_now:
-                    self.amp_was_disabled_this_epoch = True
-                # LR backoff on instability
-                for g in self.optimizer.param_groups:
-                    g["lr"] = max(g["lr"] * self.cfg.lr_reduce_factor, self.cfg.lr_floor)
+                self._mark_amp_unstable(use_amp_now)
+                self._instability_backoff()
                 self.optimizer.zero_grad(set_to_none=True)
                 if (skips / max(1, step)) > 0.50:
                     self.logger.warning("[TRAIN] >50%% batches skipped; bailing epoch.")
@@ -338,13 +459,43 @@ class Trainer:
             if (accum % self.cfg.grad_accum_steps == 0) or (step == len(self.train_loader)):
                 if self.scaler_enabled and use_amp_now:
                     self.scaler.unscale_(self.optimizer)
-                clip_grad_norm_(self.model.parameters(), max_norm=self.cfg.clip_norm)
-                self.optimizer.step()
+                grad_norm = clip_grad_norm_(self.model.parameters(), max_norm=self.cfg.clip_norm)
+                grad_norm_tensor = grad_norm if torch.is_tensor(grad_norm) else torch.tensor(float(grad_norm))
+                if not torch.isfinite(grad_norm_tensor):
+                    skips += 1
+                    self.logger.warning("[TRAIN] Non-finite gradient norm encountered at step %d. Skipping optimizer step.", step)
+                    self._mark_amp_unstable(use_amp_now)
+                    self._instability_backoff()
+                    if self.scaler_enabled and use_amp_now:
+                        # unscale_() was already called for this optimizer; advance the scaler
+                        # so the next accumulation boundary starts from a clean scaler state.
+                        self.scaler.update()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    if (skips / max(1, step)) > 0.50:
+                        self.logger.warning("[TRAIN] >50%% batches skipped; bailing epoch.")
+                        early_bail = True
+                        break
+                    continue
+                if self.scaler_enabled and use_amp_now:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                bad_params = self._non_finite_tensor_keys(self.model.state_dict())
+                if bad_params:
+                    skips += 1
+                    self.logger.warning(
+                        "[TRAIN] Optimizer step produced non-finite model parameters: %s",
+                        self._sample_bad_keys(bad_params),
+                    )
+                    self._mark_amp_unstable(use_amp_now)
+                    self._instability_backoff()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    early_bail = True
+                    break
                 if self.cfg.use_ema and self.ema is not None:
                     self.ema.update(self.model)
                 self.scheduler.step()
-                if self.scaler_enabled and use_amp_now:
-                    self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
 
             losses.append(loss.item() * self.cfg.grad_accum_steps)
@@ -372,12 +523,16 @@ class Trainer:
 
                 with self._autocast(use_amp_now):
                     logits = model(input_ids, attention_mask, aux_features=aux)
-                logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4).clamp_(-self.logit_clamp, self.logit_clamp)
+                if not torch.isfinite(logits).all():
+                    skips += 1
+                    self.logger.warning("[VAL] Non-finite logits encountered at step %d. Skipping batch.", step)
+                    continue
+                logits = logits.clamp_(-self.logit_clamp, self.logit_clamp)
 
                 if self.cfg.task == "regression":
                     loss = self.criterion(logits.float(), targets.float())
                 else:
-                    loss = self.criterion(logits.float(), targets.long())
+                    loss = self._binary_loss(logits, targets)
 
                 if not torch.isfinite(loss):
                     skips += 1
@@ -386,7 +541,7 @@ class Trainer:
                 losses.append(loss.item())
 
                 if self.cfg.task == "binary" and return_probs:
-                    p = torch.softmax(logits.float(), dim=1)[:, 1]
+                    p = self._binary_probs(logits)
                     probs_all.append(p.cpu().numpy())
                     labels_all.append(targets.cpu().numpy())
 
@@ -399,41 +554,15 @@ class Trainer:
         if self.cfg.task == "binary" and probs_all:
             probs_np = np.concatenate(probs_all)
             labels_np = np.concatenate(labels_all).astype(int)
-            try:
-                metrics["auroc"] = roc_auc_score(labels_np, probs_np)
-            except ValueError:
-                metrics["auroc"] = float("nan")
-            try:
-                metrics["auprc"] = average_precision_score(labels_np, probs_np)
-            except ValueError:
-                metrics["auprc"] = float("nan")
-            # Vectorized F1 sweep
-            thrs = np.linspace(0.05, 0.95, 19)
-            preds = (probs_np[:, None] >= thrs[None, :]).astype(int)
-            tp = (preds & (labels_np[:, None] == 1)).sum(axis=0)
-            fp = (preds & (labels_np[:, None] == 0)).sum(axis=0)
-            fn = ((1 - preds) & (labels_np[:, None] == 1)).sum(axis=0)
-            f1 = (2 * tp) / np.maximum(2 * tp + fp + fn, 1)
-            best_idx = int(np.argmax(f1))
-            metrics["best_f1"] = float(f1[best_idx])
-            metrics["best_thr"] = float(thrs[best_idx])
+            metrics = compute_binary_metrics(
+                labels_np,
+                probs_np,
+                target_precision=self.cfg.target_precision,
+                min_recall=self.cfg.min_recall,
+            )
+            metrics["pct_pred_pos_05"] = float((probs_np >= 0.5).mean())
+            metrics["pct_pred_pos_opt"] = float((probs_np >= metrics["thr_opt"]).mean())
         return avg, skips, metrics, probs_np, labels_np
-
-    def _pick_precision_threshold(self, probs: np.ndarray, labels: np.ndarray) -> Tuple[float, float, float, float]:
-        thrs = np.linspace(0.01, 0.99, 99)
-        preds = (probs[:, None] >= thrs[None, :]).astype(int)
-        tp = (preds & (labels[:, None] == 1)).sum(axis=0)
-        fp = (preds & (labels[:, None] == 0)).sum(axis=0)
-        fn = ((1 - preds) & (labels[:, None] == 1)).sum(axis=0)
-        prec = tp / np.maximum(tp + fp, 1)
-        rec = tp / np.maximum(tp + fn, 1)
-        f1 = (2 * prec * rec) / np.maximum(prec + rec, 1e-12)
-        mask = (prec >= self.cfg.target_precision) & (rec >= self.cfg.min_recall)
-        if mask.any():
-            idx = int(np.argmax(f1 * mask))
-        else:
-            idx = int(np.argmax(f1))
-        return float(thrs[idx]), float(prec[idx]), float(rec[idx]), float(f1[idx])
 
     def fit(self, best_ckpt_name: str, last_ckpt_name: str) -> Dict[str, Any]:
         # Scheduler steps consistency
@@ -449,6 +578,10 @@ class Trainer:
 
         best_ckpt = self._ckpt_path(best_ckpt_name)
         last_ckpt = self._ckpt_path(last_ckpt_name)
+        history_path = self._history_path()
+        if history_path.exists():
+            history_path.unlink()
+        self.logger.info("Validation history -> %s", history_path)
 
         for epoch in range(self.cfg.epochs):
             use_amp_now = (not self.force_fp32_next_epoch) and (epoch >= self.cfg.amp_warmup_epochs) and self.cfg.use_amp and (not self.amp_was_disabled_this_epoch)
@@ -470,24 +603,39 @@ class Trainer:
 
             decision_threshold = None
             if self.cfg.task == "binary" and probs is not None and labels is not None:
-                thr, p, r, f1p = self._pick_precision_threshold(probs, labels)
-                va_metrics["prec_thr"] = thr
-                va_metrics["prec_at_thr"] = p
-                va_metrics["rec_at_thr"] = r
-                va_metrics["f1_at_thr"] = f1p
-                self.logger.info(f"[VAL] AUROC={va_metrics.get('auroc', float('nan')):.4f} | AUPRC={va_metrics.get('auprc', float('nan')):.4f} | "
-                                 f"Best-F1={va_metrics.get('best_f1', 0.0):.4f} @ {va_metrics.get('best_thr', 0.5):.2f} | "
-                                 f"Prec-Opt thr={thr:.2f} -> P={p:.3f} R={r:.3f} F1={f1p:.3f}")
-                decision_threshold = thr
+                decision_threshold = float(va_metrics.get("thr_opt", 0.5))
+                self.logger.info(
+                    "[VAL] AUROC=%.4f | AUPRC=%.4f | F1@0.5=%.4f | F1*=%.4f @ thr=%.4f | %%>=0.5=%.4f",
+                    va_metrics.get("auroc", float("nan")),
+                    va_metrics.get("auprc", float("nan")),
+                    va_metrics.get("f1_05", float("nan")),
+                    va_metrics.get("f1_opt", float("nan")),
+                    decision_threshold,
+                    va_metrics.get("pct_pred_pos_05", float("nan")),
+                )
             current_score = self._selection_score(va_loss, va_metrics)
+            self._append_epoch_history(
+                epoch_idx=epoch,
+                train_loss=tr_loss,
+                val_loss=va_loss,
+                metrics=va_metrics,
+                selection_score=current_score,
+            )
+            bad_params = self._non_finite_tensor_keys(self.model.state_dict())
+            if bad_params:
+                self.logger.warning(
+                    "[TOXIC] Non-finite model parameters detected after epoch %d: %s",
+                    epoch + 1,
+                    self._sample_bad_keys(bad_params),
+                )
 
             # Stability/rollback heuristic
             toxic_val = (not np.isfinite(va_loss)) or (va_skips == len(self.val_loader))
             toxic_train = early_bail or (tr_skips / max(1, len(self.train_loader)) > 0.50)
-            if toxic_val or toxic_train:
+            toxic_state = bool(bad_params)
+            if toxic_val or toxic_train or toxic_state:
                 self.logger.warning("[TOXIC] Unstable epoch. LR backoff; forcing fp32 next epoch.")
-                for g in self.optimizer.param_groups:
-                    g["lr"] = max(g["lr"] * self.cfg.lr_reduce_factor, self.cfg.lr_floor)
+                self._instability_backoff()
                 self.force_fp32_next_epoch = True
                 self.amp_was_disabled_this_epoch = True
                 if best_ckpt.exists():

@@ -25,7 +25,9 @@ from src.dataset import ReviewDataset, make_collate
 from training.bert_common import (
     BertModeT,
     apply_target_transform,
+    binary_probabilities_from_logits,
     checkpoint_path,
+    save_binary_diagnostics,
     compute_binary_metrics,
     compute_count_metrics,
     get_mode_spec,
@@ -34,6 +36,7 @@ from training.bert_common import (
     metrics_path,
     predictions_path,
 )
+from training.main_figure_plots import try_generate_requested_main_figures
 
 
 def _json_ready(obj: Any) -> Any:
@@ -82,7 +85,7 @@ class EvalConfig:
     max_len: Optional[int] = None
     batch_size: int = 32
     use_aux: Optional[bool] = None
-    aux_columns: tuple[str, ...] = ("review_length", "sentiment_score", "is_verified")
+    aux_columns: Optional[tuple[str, ...]] = None
     target_precision: float = 0.30
     min_recall: float = 0.15
 
@@ -125,6 +128,22 @@ class BertInferenceSession:
         self.model: nn.Module | None = None
         self.criterion: nn.Module | None = None
 
+    def _non_finite_tensor_keys(self, state: dict[str, Any]) -> list[str]:
+        bad: list[str] = []
+        for key, value in state.items():
+            if torch.is_tensor(value) and value.dtype.is_floating_point and not torch.isfinite(value).all():
+                bad.append(str(key))
+        return bad
+
+    def _validate_checkpoint_state(self, state_dict: dict[str, torch.Tensor]) -> None:
+        bad = self._non_finite_tensor_keys(state_dict)
+        if bad:
+            preview = bad[:10]
+            suffix = "" if len(bad) <= 10 else " ..."
+            raise ValueError(
+                f"Checkpoint {self.checkpoint_path} contains non-finite parameter tensors: {preview}{suffix}"
+            )
+
     def _load_checkpoint(self, path: str) -> dict[str, Any]:
         try:
             ckpt = torch.load(path, map_location="cpu", weights_only=True)
@@ -153,6 +172,11 @@ class BertInferenceSession:
     def _build_model(self) -> tuple[nn.Module, nn.Module]:
         assert self.checkpoint_payload is not None
         aux_dim = len(self.aux_columns) if self.use_aux else 0
+        state_dict = self.checkpoint_payload["model_state_dict"]
+        classifier_weight = state_dict.get("classifier.weight")
+        num_labels = 1
+        if torch.is_tensor(classifier_weight) and classifier_weight.ndim == 2:
+            num_labels = int(classifier_weight.shape[0])
         common_kwargs = dict(
             model_name=self.checkpoint_payload.get("model_name", self.tokenizer_name),
             dropout_rate=float(self.checkpoint_payload.get("dropout_rate", 0.5)),
@@ -160,8 +184,17 @@ class BertInferenceSession:
             aux_feat_dim=aux_dim,
         )
         if self.spec.head_task == "binary":
-            model = BERTClassifier(**common_kwargs)
-            criterion: nn.Module = nn.CrossEntropyLoss()
+            model = BERTClassifier(num_labels=num_labels, **common_kwargs)
+            if num_labels == 1:
+                pos_weight = self.checkpoint_payload.get("pos_weight")
+                if pos_weight is not None:
+                    criterion = nn.BCEWithLogitsLoss(
+                        pos_weight=torch.tensor(float(pos_weight), dtype=torch.float32, device=self.device)
+                    )
+                else:
+                    criterion = nn.BCEWithLogitsLoss()
+            else:
+                criterion = nn.CrossEntropyLoss()
         else:
             model = BERTRegressor(**common_kwargs)
             loss_name = self.checkpoint_payload.get("loss_name")
@@ -212,6 +245,7 @@ class BertInferenceSession:
 
         self.model, self.criterion = self._build_model()
         state_dict = self._normalize_state_dict_keys(self.checkpoint_payload["model_state_dict"])
+        self._validate_checkpoint_state(state_dict)
         missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
         if missing or unexpected:
             self.logger.warning("State_dict mismatch. Missing=%s | Unexpected=%s", missing, unexpected)
@@ -284,7 +318,20 @@ class BertInferenceSession:
                     aux = aux.to(self.device, non_blocking=True)
 
                 logits = self.model(input_ids=input_ids, attention_mask=attention_mask, aux_features=aux)
-                loss = self.criterion(logits.float(), targets.long() if self.spec.head_task == "binary" else targets.float())
+                if not torch.isfinite(logits).all():
+                    raise ValueError(
+                        f"Model loaded from {self.checkpoint_path} produced non-finite logits during inference."
+                    )
+                if self.spec.head_task == "binary":
+                    logits_float = logits.float()
+                    if logits_float.ndim == 2 and logits_float.shape[1] == 2:
+                        loss = self.criterion(logits_float, targets.long())
+                    else:
+                        if logits_float.ndim == 2 and logits_float.shape[1] == 1:
+                            logits_float = logits_float.squeeze(-1)
+                        loss = self.criterion(logits_float, targets.float())
+                else:
+                    loss = self.criterion(logits.float(), targets.float())
                 losses.append(float(loss.item()))
                 logits_all.append(logits.detach().cpu().float().numpy())
                 targets_all.append(targets.detach().cpu().float().numpy())
@@ -298,7 +345,7 @@ class BertInferenceSession:
             "frame": prepared,
         }
         if self.spec.head_task == "binary":
-            probs = torch.softmax(torch.tensor(logits_np), dim=1).numpy()[:, 1]
+            probs = binary_probabilities_from_logits(logits_np)
             result["probabilities"] = probs
         else:
             raw_pred = invert_predictions(logits_np.reshape(-1), self.transform_meta)
@@ -341,8 +388,22 @@ class Evaluator:
                     "review_id": eval_frame["review_id"].to_numpy(),
                     "true_label": labels,
                     "prob_pos": probs,
+                    "raw_logit": outputs["logits"].reshape(-1) if outputs["logits"].ndim == 1 or outputs["logits"].shape[1] == 1 else outputs["logits"][:, 1],
                     "pred_label_05": (probs >= 0.5).astype(int),
                     "pred_label_opt": (probs >= metrics["thr_opt"]).astype(int),
+                }
+            )
+            diagnostics = save_binary_diagnostics(
+                self.cfg.out_dir,
+                f"{self.session.spec.checkpoint_stem}_{self.cfg.split}",
+                labels,
+                probs,
+                threshold_opt=float(metrics["thr_opt"]),
+            )
+            metrics.update(
+                {
+                    "pct_prob_ge_05": float(diagnostics["summary"]["pct_prob_ge_05"]),
+                    "pct_prob_ge_thr_opt": float(diagnostics["summary"]["pct_prob_ge_thr_opt"]),
                 }
             )
         else:
@@ -370,6 +431,9 @@ class Evaluator:
             "metrics": metrics,
             "prediction_path": pred_path,
         }
+        if self.session.spec.head_task == "binary":
+            payload["binary_diagnostics"] = diagnostics["summary"]
+            payload["plot_paths"] = diagnostics["plots"]
         with open(metrics_out_path, "w", encoding="utf-8") as fh:
             json.dump(_json_ready(payload), fh, indent=2)
 
@@ -380,4 +444,14 @@ class Evaluator:
                 self.logger.info("%s=%.6f", key, value)
             else:
                 self.logger.info("%s=%s", key, value)
+        if self.cfg.mode == "binary":
+            try_generate_requested_main_figures(
+                self.cfg.out_dir,
+                split=self.cfg.split,
+                logger=self.logger,
+                include_binary=True,
+                include_count=False,
+                target_precision=self.cfg.target_precision,
+                min_recall=self.cfg.min_recall,
+            )
         return payload

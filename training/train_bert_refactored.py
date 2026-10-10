@@ -11,6 +11,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
@@ -55,8 +56,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout-rate", type=float, default=0.7)
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--pos-weight", type=float, default=13.5)
     parser.add_argument("--target-precision", type=float, default=0.30)
     parser.add_argument("--min-recall", type=float, default=0.15)
+    parser.add_argument("--selection-metric", choices=["auprc", "best_f1"], default="auprc")
     parser.add_argument("--train-max-steps-per-epoch", type=int, default=None)
     parser.add_argument("--val-max-steps", type=int, default=None)
     parser.add_argument("--disable-aux", action="store_true")
@@ -66,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-mean-pooling", action="store_true", default=True)
     parser.add_argument("--no-mean-pooling", dest="use_mean_pooling", action="store_false")
     return parser.parse_args()
+
+
+def default_aux_columns_for_mode(mode: BertModeT) -> tuple[str, ...]:
+    if mode in {"count_stage2_log1p", "count_stage2_poisson"}:
+        return ("review_length", "review_age_days", "sentiment_score", "is_verified", "rating")
+    return ("review_length", "sentiment_score", "is_verified")
 
 
 def compute_aux_stats(train_df, aux_cols: tuple[str, ...]) -> tuple[dict[str, float], dict[str, float]]:
@@ -79,6 +88,41 @@ def compute_aux_stats(train_df, aux_cols: tuple[str, ...]) -> tuple[dict[str, fl
         std = float(np.std(values))
         stds[col] = std if std >= 1e-12 else 1.0
     return means, stds
+
+
+def summarize_binary_labels(frame: pd.DataFrame, label_column: str) -> dict[str, float]:
+    labels = pd.to_numeric(frame[label_column], errors="raise").to_numpy(dtype=int)
+    rows = int(labels.shape[0])
+    pos = int((labels == 1).sum())
+    neg = int((labels == 0).sum())
+    return {
+        "rows": rows,
+        "pos": pos,
+        "neg": neg,
+        "prevalence": float(pos / max(rows, 1)),
+        "neg_per_pos": float(neg / max(pos, 1)),
+    }
+
+
+def log_binary_split_balance(logger, base_dir: str, spec, train_df: pd.DataFrame, val_df: pd.DataFrame) -> dict[str, dict[str, float]]:
+    split_frames: dict[str, pd.DataFrame] = {"train": train_df, "val": val_df}
+    test_path = Path(base_dir) / f"{spec.dataset_prefix}_test.csv"
+    split_frames["test"] = pd.read_csv(test_path, usecols=[spec.label_column])
+
+    summary: dict[str, dict[str, float]] = {}
+    for split, frame in split_frames.items():
+        stats = summarize_binary_labels(frame, spec.label_column)
+        summary[split] = stats
+        logger.info(
+            "[%s] rows=%d | pos=%d | neg=%d | prevalence=%.6f | neg/pos=%.6f",
+            split.upper(),
+            stats["rows"],
+            stats["pos"],
+            stats["neg"],
+            stats["prevalence"],
+            stats["neg_per_pos"],
+        )
+    return summary
 
 
 def build_param_groups(model: nn.Module, cfg: TrainConfig) -> list[dict[str, object]]:
@@ -107,6 +151,7 @@ def build_model_and_loss(
     gradient_checkpointing: bool,
     train_df,
     label_column: str,
+    pos_weight_override: float | None,
 ) -> tuple[nn.Module, nn.Module, torch.Tensor | None, str]:
     spec = get_mode_spec(mode)
     common_kwargs = dict(
@@ -119,14 +164,15 @@ def build_model_and_loss(
     )
 
     if spec.head_task == "binary":
-        model = BERTClassifier(**common_kwargs)
+        model = BERTClassifier(num_labels=1, **common_kwargs)
         labels = train_df[label_column].to_numpy(dtype=int)
         pos = int((labels == 1).sum())
         neg = int((labels == 0).sum())
-        pos_weight = neg / max(1, pos) if pos > 0 else 1.0
-        class_weights = torch.tensor([1.0, pos_weight], dtype=torch.float32, device=device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=cfg.ce_label_smooth)
-        return model, criterion, class_weights, "cross_entropy"
+        empirical_pos_weight = neg / max(1, pos) if pos > 0 else 1.0
+        pos_weight_value = float(pos_weight_override) if pos_weight_override is not None else float(empirical_pos_weight)
+        pos_weight = torch.tensor(pos_weight_value, dtype=torch.float32, device=device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        return model, criterion, pos_weight, "bce_with_logits"
 
     model = BERTRegressor(**common_kwargs)
     if mode == "count_stage2_poisson":
@@ -146,7 +192,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Training mode=%s on device=%s", mode, device)
 
-    aux_cols = ("review_length", "sentiment_score", "is_verified")
+    aux_cols = default_aux_columns_for_mode(mode)
     use_aux = not args.disable_aux
 
     cfg = TrainConfig(
@@ -167,6 +213,8 @@ def main() -> None:
         val_max_steps=args.val_max_steps,
         target_precision=args.target_precision,
         min_recall=args.min_recall,
+        loss_kind=("bce" if spec.head_task == "binary" else "smooth"),
+        selection_metric=args.selection_metric,
         base_dir=str(out_dir),
         ckpt_dir=str(out_dir / "checkpoints"),
         logs_dir=str(out_dir / "logs"),
@@ -178,6 +226,9 @@ def main() -> None:
     train_df = load_mode_dataframe(args.base_dir, mode, "train")
     val_df = load_mode_dataframe(args.base_dir, mode, "val")
     logger.info("Loaded %d train rows and %d val rows", len(train_df), len(val_df))
+    binary_split_summary: dict[str, dict[str, float]] = {}
+    if spec.head_task == "binary":
+        binary_split_summary = log_binary_split_balance(logger, args.base_dir, spec, train_df, val_df)
 
     transform_metadata: dict[str, object] = {
         "mode": mode,
@@ -228,6 +279,13 @@ def main() -> None:
     if use_aux:
         ds_train.set_aux_stats(aux_means, aux_stds)
         ds_val.set_aux_stats(aux_means, aux_stds)
+    logger.info(
+        "ReviewDataset row retention | train=%d/%d | val=%d/%d",
+        len(ds_train),
+        len(train_df),
+        len(ds_val),
+        len(val_df),
+    )
 
     train_loader = make_dataloader(
         ds_train,
@@ -256,7 +314,15 @@ def main() -> None:
         gradient_checkpointing=args.gradient_checkpointing,
         train_df=train_df,
         label_column=spec.label_column,
+        pos_weight_override=(args.pos_weight if spec.head_task == "binary" else None),
     )
+    if spec.head_task == "binary" and class_weights is not None:
+        empirical_ratio = binary_split_summary["train"]["neg_per_pos"]
+        logger.info(
+            "Binary loss=BCEWithLogitsLoss | pos_weight=%.6f | empirical_train_neg_per_pos=%.6f",
+            float(class_weights.detach().cpu().item()),
+            empirical_ratio,
+        )
 
     optimizer = torch.optim.AdamW(build_param_groups(model, cfg), eps=1e-8, betas=(0.9, 0.999))
     steps_per_epoch_cap = cfg.train_max_steps_per_epoch or len(train_loader)
@@ -287,10 +353,16 @@ def main() -> None:
         "y_mean": target_transform.get("y_mean"),
         "y_std": target_transform.get("y_std"),
         "loss_name": loss_name,
+        "selection_metric": args.selection_metric,
         "dropout_rate": args.dropout_rate,
         "use_mean_pooling": args.use_mean_pooling,
         "gradient_checkpointing": args.gradient_checkpointing,
+        "configured_pos_weight": (float(args.pos_weight) if spec.head_task == "binary" else None),
     }
+    if class_weights is not None:
+        checkpoint_extras["pos_weight"] = float(class_weights.detach().cpu().item())
+    if binary_split_summary:
+        checkpoint_extras["binary_split_summary"] = binary_split_summary
 
     trainer = Trainer(
         cfg=replace(cfg, checkpoint_extras=checkpoint_extras),
@@ -315,7 +387,10 @@ def main() -> None:
     last_name = Path(checkpoint_path(out_dir, mode, "last")).name
     result = trainer.fit(best_ckpt_name=best_name, last_ckpt_name=last_name)
 
-    selection_metric = "AUPRC" if spec.head_task == "binary" else "negative validation loss"
+    if spec.head_task == "binary":
+        selection_metric = "AUPRC" if args.selection_metric == "auprc" else "best F1"
+    else:
+        selection_metric = "negative validation loss"
     logger.info("Finished mode=%s | best %s=%.6f", mode, selection_metric, result["best_score"])
     logger.info("Best checkpoint -> %s", checkpoint_path(out_dir, mode, "best"))
     logger.info("Last checkpoint -> %s", checkpoint_path(out_dir, mode, "last"))

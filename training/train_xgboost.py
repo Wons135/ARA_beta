@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -13,12 +12,14 @@ from tqdm import tqdm
 from xgboost.callback import TrainingCallback
 
 from xgboost_common import (
+    MODE_CHOICES,
     ModeT,
     checkpoint_path,
     compute_binary_metrics,
     compute_count_metrics,
     default_model_metadata,
     get_mode_spec,
+    load_json,
     load_split_bundle,
     prediction_csv_path,
     safe_path,
@@ -78,12 +79,9 @@ class XGBConfig:
                 reg_alpha=0.0,
                 random_state=self.random_seed,
             )
-            if spec.role == "classifier":
-                params["objective"] = spec.default_objective
-                params["eval_metric"] = spec.default_eval_metric
-            else:
-                params["objective"] = spec.default_objective
-                params["eval_metric"] = spec.default_eval_metric
+            params["objective"] = spec.default_objective
+            params["eval_metric"] = spec.default_eval_metric
+            params.update(spec.objective_params)
             self.xgb_params = params
 
 
@@ -91,17 +89,10 @@ class XGBTrainer:
     def __init__(self, cfg: XGBConfig):
         self.cfg = cfg
         self.spec = get_mode_spec(cfg.mode)
-        self.logger = setup_logger(f"xgb_train_{cfg.mode}")
+        log_path = safe_path(cfg.out_dir, "logs", f"{self.spec.checkpoint_stem}.log")
+        self.logger = setup_logger(f"xgb_train_{cfg.mode}", log_path)
         np.random.seed(cfg.random_seed)
         xgb.set_config(verbosity=0)
-
-        log_path = safe_path(cfg.out_dir, "logs", f"{self.spec.checkpoint_stem}.log")
-        if not any(
-            isinstance(handler, logging.FileHandler) and Path(handler.baseFilename).resolve() == Path(log_path).resolve()
-            for handler in self.logger.handlers
-        ):
-            file_handler = xgb_train_file_handler(log_path)
-            self.logger.addHandler(file_handler)
 
     def load_data(self):
         self.logger.info("Loading %s training/validation data", self.cfg.mode)
@@ -183,10 +174,11 @@ class XGBTrainer:
             self.val_predictions = preds
             self.val_model_outputs = raw_preds
             self.logger.info(
-                "[VAL] RMSE=%.4f | MAE=%.4f | R2=%.4f | PosRMSE=%.4f | PosMAE=%.4f",
+                "[VAL] RMSE=%.4f | MAE=%.4f | R2=%.4f | Spearman=%.4f | PosRMSE=%.4f | PosMAE=%.4f",
                 metrics["rmse"],
                 metrics["mae"],
                 metrics["r2"],
+                metrics["spearman_rho"],
                 metrics["positive_only_rmse"],
                 metrics["positive_only_mae"],
             )
@@ -201,12 +193,16 @@ class XGBTrainer:
         fi_path = save_feature_importance_plot(self.model, self.cfg.out_dir, self.spec.checkpoint_stem)
         self.logger.info("Saved feature importance -> %s", fi_path)
 
+        feature_meta_path = Path(self.cfg.base_dir) / f"labels_meta_{self.spec.feature_task_suffix}.json"
+        feature_bundle_metadata = load_json(feature_meta_path) if feature_meta_path.exists() else None
+
         metadata = {
             "config": asdict(self.cfg),
             "mode": default_model_metadata(self.cfg.mode),
             "model_path": model_path,
             "model_sha256": model_sha,
             "feature_importance_plot": fi_path,
+            "feature_bundle_metadata": feature_bundle_metadata,
             "rows": {
                 "train": int(train_bundle.frame.shape[0]),
                 "val": int(val_bundle.frame.shape[0]),
@@ -245,17 +241,11 @@ class XGBTrainer:
         self.logger.info("Saved validation predictions -> %s", pred_path)
 
 
-def xgb_train_file_handler(log_path: str):
-    handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    return handler
-
-
 def parse_args() -> XGBConfig:
-    parser = argparse.ArgumentParser(description="Train XGBoost models for binary and count tasks.")
+    parser = argparse.ArgumentParser(description="Train XGBoost baselines for binary and count-helpfulness tasks.")
     parser.add_argument(
         "--mode",
-        choices=["binary", "count_stage1", "count_stage2_poisson", "count_stage2_log1p"],
+        choices=MODE_CHOICES,
         default="binary",
     )
     parser.add_argument("--base-dir", default=str(ROOT / "datasets" / "preprocessed"))

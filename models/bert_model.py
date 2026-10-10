@@ -188,7 +188,7 @@ class BERTRegressor(BaseBERTWithAux):
 
 class BERTClassifier(BaseBERTWithAux):
     """
-    DistilBERT-based binary classifier (2-logit output).
+    DistilBERT-based binary classifier.
     Backward-compatible init args: `use_mean_pooling` retained; mapped to pooling mode.
     """
     def __init__(
@@ -197,6 +197,7 @@ class BERTClassifier(BaseBERTWithAux):
         dropout_rate: float = 0.5,
         use_mean_pooling: bool = False,
         aux_feat_dim: int = 0,
+        num_labels: int = 1,
         freeze_init: int = 2,
         gradient_checkpointing: bool = False,
     ):
@@ -207,9 +208,13 @@ class BERTClassifier(BaseBERTWithAux):
                          aux_feat_dim=aux_feat_dim,
                          freeze_init=freeze_init,
                          gradient_checkpointing=gradient_checkpointing)
-        self.classifier = nn.Linear(self._final_in, 2)
+        self.num_labels = int(num_labels)
+        if self.num_labels not in (1, 2):
+            raise ValueError("BERTClassifier only supports num_labels=1 or num_labels=2.")
+        self.classifier = nn.Linear(self._final_in, self.num_labels)
         nn.init.xavier_uniform_(self.classifier.weight)
         nn.init.constant_(self.classifier.bias, 0.0)
 
     def _forward_head(self, fused: torch.Tensor) -> torch.Tensor:
-        return self.classifier(fused)
+        logits = self.classifier(fused)
+        return logits.squeeze(-1) if self.num_labels == 1 else logits
