@@ -1,0 +1,8 @@
+.venv/
+datasets/
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+outputs/weighted_rating/review_level_inputs.csv
+outputs/weighted_rating/per_item.csv
+outputs/weighted_rating/bert_binary_inferred_greyband.csv
