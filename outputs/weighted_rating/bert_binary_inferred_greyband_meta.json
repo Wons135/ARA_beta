@@ -1,9 +1,0 @@
-{
-  "rows": 217414,
-  "batch_size": 64,
-  "seconds": 429.4220684000029,
-  "rows_per_second": 506.2944268562387,
-  "device": "cuda",
-  "cuda_available": true,
-  "cuda_device": "NVIDIA GeForce RTX 4060 Ti"
-}

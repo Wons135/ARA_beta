@@ -1,0 +1,10 @@
+* text=auto
+*.py text eol=lf
+*.sh text eol=lf
+*.bat text eol=crlf
+*.md text eol=lf
+*.jsonl text eol=lf
+_to_review/ export-ignore
+outputs/ export-ignore
+docs/REPOSITORY_INVENTORY.md export-ignore
+docs/SUBMISSION_AUDIT.md export-ignore

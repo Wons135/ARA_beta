@@ -1,0 +1,21 @@
+{
+  "kind": "original synthetic movie reviews; NOT Amazon review excerpts",
+  "generator": "scripts/build_demo_sample.py",
+  "seed": 42,
+  "rows": 1024,
+  "items": 8,
+  "vote_counts": {
+    "0": 554,
+    "1": 98,
+    "2": 95,
+    "3": 85,
+    "5": 69,
+    "8": 45,
+    "13": 35,
+    "21": 23,
+    "34": 20
+  },
+  "sha256": "b75e854e3938760a11ec6bfe43a5609c485250036625fb8becff9087839dd89c",
+  "schema_source": "https://amazon-reviews-2023.github.io/main.html",
+  "text_provenance": "Original sentence templates in the generator; no real users or products."
+}
